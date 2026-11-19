@@ -35,16 +35,33 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the database to answer the token lookup (it may be waking from sleep).
 const DB_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn to_message(id: i64, match_id: Uuid, sender_id: Uuid, body: String, at: chrono::DateTime<chrono::Utc>) -> ChatMessage {
-    ChatMessage { id, match_id, sender_id, body, created_at_ms: at.timestamp_millis() }
+fn to_message(
+    id: i64,
+    match_id: Uuid,
+    sender_id: Uuid,
+    body: String,
+    at: chrono::DateTime<chrono::Utc>,
+) -> ChatMessage {
+    ChatMessage {
+        id,
+        match_id,
+        sender_id,
+        body,
+        created_at_ms: at.timestamp_millis(),
+    }
 }
 
 /// If `user` is part of the match, returns the other participant.
-async fn other_participant(db: &sqlx::PgPool, match_id: Uuid, user: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
-    let pair = sqlx::query_as::<_, (Uuid, Uuid)>("SELECT user_a, user_b FROM matches WHERE id = $1")
-        .bind(match_id)
-        .fetch_optional(db)
-        .await?;
+async fn other_participant(
+    db: &sqlx::PgPool,
+    match_id: Uuid,
+    user: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let pair =
+        sqlx::query_as::<_, (Uuid, Uuid)>("SELECT user_a, user_b FROM matches WHERE id = $1")
+            .bind(match_id)
+            .fetch_optional(db)
+            .await?;
     Ok(pair.and_then(|(a, b)| {
         if a == user {
             Some(b)
@@ -100,10 +117,17 @@ pub async fn matches(
         .into_iter()
         .map(|r| {
             let last_message = match (r.lm_id, r.lm_sender, r.lm_body, r.lm_at) {
-                (Some(id), Some(sender), Some(body), Some(at)) => Some(to_message(id, r.match_id, sender, body, at)),
+                (Some(id), Some(sender), Some(body), Some(at)) => {
+                    Some(to_message(id, r.match_id, sender, body, at))
+                }
                 _ => None,
             };
-            MatchSummary { match_id: r.match_id, profile: r.profile.into(), last_message, unread: r.unread }
+            MatchSummary {
+                match_id: r.match_id,
+                profile: r.profile.into(),
+                last_message,
+                unread: r.unread,
+            }
         })
         .collect();
     Ok(Json(list))
@@ -159,16 +183,24 @@ pub async fn history(
     .await?
     .unwrap_or(0);
 
-    Ok(Json(ChatHistory { messages, other_last_read, has_more }))
+    Ok(Json(ChatHistory {
+        messages,
+        other_last_read,
+        has_more,
+    }))
 }
 
 // ───────── WebSocket ─────────
 
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(16 * 1024).on_upgrade(move |socket| handle_socket(socket, state))
+    ws.max_message_size(16 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn send_frame(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>, msg: &ServerMsg) -> bool {
+async fn send_frame(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: &ServerMsg,
+) -> bool {
     match serde_json::to_string(msg) {
         Ok(json) => sink.send(Message::Text(json.into())).await.is_ok(),
         Err(_) => false,
@@ -198,7 +230,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     })
     .await;
 
-    let token = match first_frame.ok().flatten().and_then(|t| serde_json::from_str::<ClientMsg>(&t).ok()) {
+    let token = match first_frame
+        .ok()
+        .flatten()
+        .and_then(|t| serde_json::from_str::<ClientMsg>(&t).ok())
+    {
         Some(ClientMsg::Auth { token }) => token,
         _ => {
             // No usable auth frame: this client is not who it claims to be.
@@ -220,12 +256,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
         Ok(Err(e)) => {
             tracing::warn!("websocket auth: database error, asking client to retry: {e}");
-            let _ = send_frame(&mut sink, &ServerMsg::Error { message: "The server is waking up. Retrying…".into() }).await;
+            let _ = send_frame(
+                &mut sink,
+                &ServerMsg::Error {
+                    message: "The server is waking up. Retrying…".into(),
+                },
+            )
+            .await;
             return;
         }
         Err(_) => {
             tracing::warn!("websocket auth: database lookup timed out, asking client to retry");
-            let _ = send_frame(&mut sink, &ServerMsg::Error { message: "The server is waking up. Retrying…".into() }).await;
+            let _ = send_frame(
+                &mut sink,
+                &ServerMsg::Error {
+                    message: "The server is waking up. Retrying…".into(),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -240,7 +288,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    let mut conn = Conn { user, others: HashMap::new(), recent_sends: VecDeque::new() };
+    let mut conn = Conn {
+        user,
+        others: HashMap::new(),
+        recent_sends: VecDeque::new(),
+    };
     while let Some(Ok(frame)) = stream.next().await {
         match frame {
             Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text) {
@@ -251,7 +303,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
                 Err(_) => {
-                    let _ = own_tx.send(ServerMsg::Error { message: "Unrecognised message.".into() });
+                    let _ = own_tx.send(ServerMsg::Error {
+                        message: "Unrecognised message.".into(),
+                    });
                 }
             },
             Message::Close(_) => break,
@@ -266,7 +320,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 /// Sliding-window rate limit: at most SEND_LIMIT messages per SEND_WINDOW per connection.
 /// Records the send and returns true if allowed.
 fn allow_send(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
-    while recent.front().is_some_and(|t| now.duration_since(*t) > SEND_WINDOW) {
+    while recent
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > SEND_WINDOW)
+    {
         recent.pop_front();
     }
     if recent.len() >= SEND_LIMIT {
@@ -276,44 +333,12 @@ fn allow_send(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn allows_the_limit_then_blocks() {
-        let mut recent = VecDeque::new();
-        let now = Instant::now();
-        for i in 0..SEND_LIMIT {
-            assert!(allow_send(&mut recent, now), "send {i} should be allowed");
-        }
-        assert!(!allow_send(&mut recent, now), "send over the limit should be refused");
-    }
-
-    #[test]
-    fn frees_up_once_the_window_passes() {
-        let mut recent = VecDeque::new();
-        let start = Instant::now();
-        for _ in 0..SEND_LIMIT {
-            assert!(allow_send(&mut recent, start));
-        }
-        assert!(!allow_send(&mut recent, start + Duration::from_secs(5)));
-        assert!(allow_send(&mut recent, start + SEND_WINDOW + Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn refused_sends_are_not_counted() {
-        let mut recent = VecDeque::new();
-        let now = Instant::now();
-        for _ in 0..(SEND_LIMIT + 10) {
-            allow_send(&mut recent, now);
-        }
-        assert_eq!(recent.len(), SEND_LIMIT);
-    }
-}
-
 /// Returns an error message to show to this connection only.
-async fn handle_client_msg(state: &AppState, conn: &mut Conn, msg: ClientMsg) -> Result<(), String> {
+async fn handle_client_msg(
+    state: &AppState,
+    conn: &mut Conn,
+    msg: ClientMsg,
+) -> Result<(), String> {
     const GENERIC: &str = "Something went wrong.";
     match msg {
         ClientMsg::Auth { .. } => Ok(()),
@@ -324,7 +349,9 @@ async fn handle_client_msg(state: &AppState, conn: &mut Conn, msg: ClientMsg) ->
                 return Ok(());
             }
             if body.chars().count() > MAX_MESSAGE_LEN {
-                return Err(format!("Messages can be at most {MAX_MESSAGE_LEN} characters."));
+                return Err(format!(
+                    "Messages can be at most {MAX_MESSAGE_LEN} characters."
+                ));
             }
 
             if !allow_send(&mut conn.recent_sends, Instant::now()) {
@@ -362,7 +389,9 @@ async fn handle_client_msg(state: &AppState, conn: &mut Conn, msg: ClientMsg) ->
             };
             conn.others.insert(match_id, other);
 
-            let event = ServerMsg::Message { message: to_message(id, match_id, conn.user, body, at) };
+            let event = ServerMsg::Message {
+                message: to_message(id, match_id, conn.user, body, at),
+            };
             state.hub.send_to(conn.user, &event); // echo to the sender (all their tabs)
             state.hub.send_to(other, &event);
             Ok(())
@@ -370,7 +399,14 @@ async fn handle_client_msg(state: &AppState, conn: &mut Conn, msg: ClientMsg) ->
 
         ClientMsg::Typing { match_id, typing } => {
             let other = participant(state, conn, match_id).await?;
-            state.hub.send_to(other, &ServerMsg::Typing { match_id, user_id: conn.user, typing });
+            state.hub.send_to(
+                other,
+                &ServerMsg::Typing {
+                    match_id,
+                    user_id: conn.user,
+                    typing,
+                },
+            );
             Ok(())
         }
 
@@ -394,7 +430,11 @@ async fn handle_client_msg(state: &AppState, conn: &mut Conn, msg: ClientMsg) ->
                 GENERIC.to_string()
             })?;
 
-            let event = ServerMsg::Read { match_id, user_id: conn.user, up_to };
+            let event = ServerMsg::Read {
+                match_id,
+                user_id: conn.user,
+                up_to,
+            };
             state.hub.send_to(other, &event);
             state.hub.send_to(conn.user, &event); // keeps unread badges in sync across my tabs
             Ok(())
@@ -413,4 +453,46 @@ async fn participant(state: &AppState, conn: &mut Conn, match_id: Uuid) -> Resul
         .ok_or_else(|| "You have no pact with this player.".to_string())?;
     conn.others.insert(match_id, other);
     Ok(other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_the_limit_then_blocks() {
+        let mut recent = VecDeque::new();
+        let now = Instant::now();
+        for i in 0..SEND_LIMIT {
+            assert!(allow_send(&mut recent, now), "send {i} should be allowed");
+        }
+        assert!(
+            !allow_send(&mut recent, now),
+            "send over the limit should be refused"
+        );
+    }
+
+    #[test]
+    fn frees_up_once_the_window_passes() {
+        let mut recent = VecDeque::new();
+        let start = Instant::now();
+        for _ in 0..SEND_LIMIT {
+            assert!(allow_send(&mut recent, start));
+        }
+        assert!(!allow_send(&mut recent, start + Duration::from_secs(5)));
+        assert!(allow_send(
+            &mut recent,
+            start + SEND_WINDOW + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn refused_sends_are_not_counted() {
+        let mut recent = VecDeque::new();
+        let now = Instant::now();
+        for _ in 0..(SEND_LIMIT + 10) {
+            allow_send(&mut recent, now);
+        }
+        assert_eq!(recent.len(), SEND_LIMIT);
+    }
 }

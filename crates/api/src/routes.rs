@@ -1,14 +1,15 @@
 use axum::{extract::State, http::HeaderMap, Json};
 use sqlx::FromRow;
 use tomo_shared::{
-    AuthResponse, DevLoginRequest, DiscoverCard, Health, Me, MatchedWith, Profile, ProfileInput, SwipeRequest,
-    SwipeResponse, User,
+    AuthResponse, DevLoginRequest, DiscordInfo, DiscoverCard, Game, Health, MatchedWith, Me,
+    Profile, ProfileInput, SwipeRequest, SwipeResponse, User,
 };
 use uuid::Uuid;
 
 use crate::{
-    auth::{bearer_token, hash_token, new_token, AuthUser},
+    auth::{bearer_token, create_session, hash_token, AuthUser},
     error::ApiError,
+    games::all_known,
     ranking::{self, Candidate},
     safety::is_blocked,
     AppState,
@@ -24,12 +25,16 @@ pub struct ProfileRow {
     pub display_name: String,
     pub bio: String,
     pub avatar: String,
+    pub avatar_url: Option<String>,
     pub hue: i16,
     pub rank: String,
     pub region: String,
     pub playstyle: String,
     pub mic: bool,
-    pub games: Vec<String>,
+    /// Steam app ids and names, aligned and in the order the person listed them.
+    pub game_ids: Vec<i32>,
+    pub game_names: Vec<String>,
+    pub game_banners: Vec<Option<String>>,
 }
 
 impl From<ProfileRow> for Profile {
@@ -39,8 +44,19 @@ impl From<ProfileRow> for Profile {
             display_name: r.display_name,
             bio: r.bio,
             avatar: r.avatar,
+            avatar_url: r.avatar_url,
             hue: r.hue.clamp(0, 360) as u16,
-            games: r.games,
+            games: r
+                .game_ids
+                .into_iter()
+                .zip(r.game_names)
+                .zip(r.game_banners)
+                .map(|((id, name), banner)| Game {
+                    app_id: id.max(0) as u32,
+                    name,
+                    banner,
+                })
+                .collect(),
             rank: r.rank,
             region: r.region,
             playstyle: r.playstyle,
@@ -50,23 +66,35 @@ impl From<ProfileRow> for Profile {
 }
 
 pub async fn load_profile(db: &sqlx::PgPool, user_id: Uuid) -> Result<Option<Profile>, ApiError> {
-    let row = sqlx::query_as::<_, ProfileRow>(concat!("SELECT ", profile_cols!(), " FROM profiles WHERE user_id = $1"))
-        .bind(user_id)
-        .fetch_optional(db)
-        .await?;
+    let row = sqlx::query_as::<_, ProfileRow>(concat!(
+        "SELECT ",
+        profile_cols!(),
+        " FROM profiles WHERE user_id = $1"
+    ))
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
     Ok(row.map(Profile::from))
 }
 
 /// Everything except signing in requires a profile (which also means the 18+ box was ticked).
 pub async fn require_profile(db: &sqlx::PgPool, user_id: Uuid) -> Result<Profile, ApiError> {
-    load_profile(db, user_id).await?.ok_or(ApiError::Conflict("Create your profile first."))
+    load_profile(db, user_id)
+        .await?
+        .ok_or(ApiError::Conflict("Create your profile first."))
 }
 
 // ───────── Health ─────────
 
 pub async fn health(State(state): State<AppState>) -> Json<Health> {
-    let database = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.db).await.is_ok();
-    Json(Health { status: "ok".into(), database })
+    let database = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+        .is_ok();
+    Json(Health {
+        status: "ok".into(),
+        database,
+    })
 }
 
 // ───────── Auth ─────────
@@ -77,13 +105,15 @@ pub async fn dev_login(
     State(state): State<AppState>,
     Json(req): Json<DevLoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    if !state.dev_auth {
+    if !state.config.dev_auth {
         return Err(ApiError::Forbidden("Dev login is disabled."));
     }
     let username = req.username.trim().to_string();
     let len = username.chars().count();
     if !(2..=24).contains(&len)
-        || !username.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
         return Err(ApiError::BadRequest(
             "Username must be 2-24 characters: letters, numbers, _ - .".into(),
@@ -99,14 +129,11 @@ pub async fn dev_login(
     .fetch_one(&state.db)
     .await?;
 
-    let token = new_token();
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() + interval '30 days')")
-        .bind(hash_token(&token))
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
-    Ok(Json(AuthResponse { token, user: User { id, username } }))
+    let token = create_session(&state.db, id).await?;
+    Ok(Json(AuthResponse {
+        token,
+        user: User { id, username },
+    }))
 }
 
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<(), ApiError> {
@@ -119,14 +146,30 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result
     Ok(())
 }
 
-pub async fn me(State(state): State<AppState>, AuthUser(uid): AuthUser) -> Result<Json<Me>, ApiError> {
-    let (id, username, adult_confirmed): (Uuid, String, bool) =
-        sqlx::query_as("SELECT id, username, adult_confirmed_at IS NOT NULL FROM users WHERE id = $1")
-            .bind(uid)
-            .fetch_one(&state.db)
-            .await?;
+pub async fn me(
+    State(state): State<AppState>,
+    AuthUser(uid): AuthUser,
+) -> Result<Json<Me>, ApiError> {
+    let (id, username, adult_confirmed, discord_name, discord_avatar): (Uuid, String, bool, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT id, username, adult_confirmed_at IS NOT NULL, discord_global_name, discord_avatar_url
+             FROM users WHERE id = $1",
+        )
+        .bind(uid)
+        .fetch_one(&state.db)
+        .await?;
     let profile = load_profile(&state.db, uid).await?;
-    Ok(Json(Me { user: User { id, username }, profile, adult_confirmed }))
+    // Only people who signed in with Discord have a Discord picture to offer.
+    let discord = discord_avatar.map(|avatar_url| DiscordInfo {
+        display_name: discord_name.unwrap_or_else(|| username.clone()),
+        avatar_url,
+    });
+    Ok(Json(Me {
+        user: User { id, username },
+        profile,
+        adult_confirmed,
+        discord,
+    }))
 }
 
 // ───────── Profile ─────────
@@ -138,15 +181,38 @@ pub async fn put_profile(
 ) -> Result<Json<Profile>, ApiError> {
     input.validate().map_err(ApiError::BadRequest)?;
 
+    // Games must be ones this server has seen from Steam, so a name can never be made up.
+    let game_ids: Vec<i32> = input.games.iter().map(|g| *g as i32).collect();
+    if !all_known(&state.db, &game_ids).await? {
+        return Err(ApiError::BadRequest(
+            "One of those games is not recognised. Search for it again and re-add it.".into(),
+        ));
+    }
+
+    let (already_confirmed, discord_avatar): (bool, Option<String>) = sqlx::query_as(
+        "SELECT adult_confirmed_at IS NOT NULL, discord_avatar_url FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_one(&state.db)
+    .await?;
+
+    // The picture comes only from what Discord told us at sign-in, never from the request.
+    let avatar_url = if input.use_discord_avatar {
+        Some(discord_avatar.ok_or_else(|| {
+            ApiError::BadRequest(
+                "You can only use a Discord avatar when signed in with Discord.".into(),
+            )
+        })?)
+    } else {
+        None
+    };
+
     // 18+ gate: must be ticked the first time, and is recorded on the account.
-    let already_confirmed =
-        sqlx::query_scalar::<_, bool>("SELECT adult_confirmed_at IS NOT NULL FROM users WHERE id = $1")
-            .bind(uid)
-            .fetch_one(&state.db)
-            .await?;
     if !already_confirmed {
         if !input.adult_confirmed {
-            return Err(ApiError::BadRequest("You must confirm that you are 18 or older.".into()));
+            return Err(ApiError::BadRequest(
+                "You must confirm that you are 18 or older.".into(),
+            ));
         }
         sqlx::query("UPDATE users SET adult_confirmed_at = now() WHERE id = $1")
             .bind(uid)
@@ -155,12 +221,14 @@ pub async fn put_profile(
     }
 
     let row = sqlx::query_as::<_, ProfileRow>(concat!(
-        "INSERT INTO profiles (user_id, display_name, bio, avatar, hue, rank, region, playstyle, mic, games)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "INSERT INTO profiles (user_id, display_name, bio, avatar, hue, rank, region, playstyle, mic, game_ids,
+                               use_discord_avatar, avatar_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (user_id) DO UPDATE SET
             display_name = EXCLUDED.display_name, bio = EXCLUDED.bio, avatar = EXCLUDED.avatar,
             hue = EXCLUDED.hue, rank = EXCLUDED.rank, region = EXCLUDED.region,
-            playstyle = EXCLUDED.playstyle, mic = EXCLUDED.mic, games = EXCLUDED.games,
+            playstyle = EXCLUDED.playstyle, mic = EXCLUDED.mic, game_ids = EXCLUDED.game_ids,
+            use_discord_avatar = EXCLUDED.use_discord_avatar, avatar_url = EXCLUDED.avatar_url,
             updated_at = now()
          RETURNING ",
         profile_cols!()
@@ -174,7 +242,9 @@ pub async fn put_profile(
     .bind(&input.region)
     .bind(&input.playstyle)
     .bind(input.mic)
-    .bind(&input.games)
+    .bind(&game_ids)
+    .bind(input.use_discord_avatar)
+    .bind(&avatar_url)
     .fetch_one(&state.db)
     .await?;
     Ok(Json(row.into()))
@@ -187,6 +257,8 @@ struct CandidateRow {
     #[sqlx(flatten)]
     profile: ProfileRow,
     likes_me: bool,
+    is_friend: bool,
+    shared_servers: Vec<String>,
 }
 
 pub async fn discover(
@@ -200,7 +272,13 @@ pub async fn discover(
         "SELECT ",
         profile_cols_p!(),
         ",
-            EXISTS (SELECT 1 FROM swipes s WHERE s.swiper_id = p.user_id AND s.target_id = $1 AND s.liked) AS likes_me
+            EXISTS (SELECT 1 FROM swipes s WHERE s.swiper_id = p.user_id AND s.target_id = $1 AND s.liked) AS likes_me,
+            EXISTS (SELECT 1 FROM friendships f
+                    WHERE f.user_a = LEAST($1, p.user_id) AND f.user_b = GREATEST($1, p.user_id)) AS is_friend,
+            ARRAY(SELECT mg.guild_name FROM user_guilds mg
+                  JOIN user_guilds tg ON tg.guild_id = mg.guild_id
+                  WHERE mg.user_id = $1 AND tg.user_id = p.user_id
+                  ORDER BY mg.guild_name) AS shared_servers
          FROM profiles p
          WHERE p.user_id <> $1
            AND NOT EXISTS (SELECT 1 FROM swipes s WHERE s.swiper_id = $1 AND s.target_id = p.user_id)
@@ -217,7 +295,12 @@ pub async fn discover(
 
     let candidates = rows
         .into_iter()
-        .map(|r| Candidate { profile: r.profile.into(), likes_me: r.likes_me })
+        .map(|r| Candidate {
+            profile: r.profile.into(),
+            likes_me: r.likes_me,
+            is_friend: r.is_friend,
+            shared_servers: r.shared_servers,
+        })
         .collect();
     Ok(Json(ranking::rank_candidates(&me, candidates, DECK_SIZE)))
 }
@@ -261,7 +344,11 @@ pub async fn swipe(
 
         if they_like_me {
             // Store the pair ordered so (a, b) and (b, a) are the same match.
-            let (a, b) = if uid < req.target_id { (uid, req.target_id) } else { (req.target_id, uid) };
+            let (a, b) = if uid < req.target_id {
+                (uid, req.target_id)
+            } else {
+                (req.target_id, uid)
+            };
             // The no-op update makes RETURNING work whether the row is new or already existed.
             let match_id: Uuid = sqlx::query_scalar(
                 "INSERT INTO matches (user_a, user_b) VALUES ($1, $2)
@@ -272,7 +359,10 @@ pub async fn swipe(
             .bind(b)
             .fetch_one(&mut *tx)
             .await?;
-            matched = Some(MatchedWith { match_id, profile: target });
+            matched = Some(MatchedWith {
+                match_id,
+                profile: target,
+            });
         }
     }
     tx.commit().await?;
