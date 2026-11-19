@@ -45,3 +45,34 @@ jobs:
       # configuration, and the Discord and Steam clients (against fakes started inside the tests).
       - name: Unit tests
         run: cargo test -p tomo-shared -p tomo-api
+
+  # Render builds this same Dockerfile to run the API. Building it here means a broken image is caught
+  # in the pull request, not during a live deploy.
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the API image (not published)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: tomo-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Prove the image actually starts: with no database configured it must refuse and say why.
+      # (That also shows the binary and its libraries work inside the slim runtime image.)
+      - name: Smoke test the image
+        run: |
+          set +e
+          output=$(docker run --rm tomo-api:ci 2>&1)
+          code=$?
+          echo "$output"
+          if [ "$code" -eq 0 ]; then echo "::error::The API started without DATABASE_URL"; exit 1; fi
+          echo "$output" | grep -q "DATABASE_URL is not set" || { echo "::error::Unexpected startup message"; exit 1; }

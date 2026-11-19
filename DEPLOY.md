@@ -37,7 +37,7 @@ Cloudflare Pages serves that branch. No API tokens are involved anywhere.
 1. In GitHub open the repo → **Settings → Secrets and variables → Actions → Variables tab →
    New repository variable**.
 2. Name: `TOMO_API_URL`, value: your Render address from step 1 (no trailing slash).
-3. **Actions → Build website → Run workflow**. When it finishes, a `gh-pages` branch exists.
+3. **Actions → Build and publish website → Run workflow**. When it finishes, a `gh-pages` branch exists. (From then on it runs by itself after every successful CI run on `main`. Until the variable exists, the workflow skips quietly.)
 
 ### 3. Host the website on Cloudflare Pages
 1. Create a free account at <https://dash.cloudflare.com> and open **Workers & Pages**.
@@ -68,9 +68,10 @@ Open your Cloudflare address → **Sign in → Continue with Discord**. You shou
 profile page.
 
 ## Updating later
-Push to `main`. Render rebuilds the API by itself, and the website workflow rebuilds the site
-when website or shared code changes. Database changes are migrations in `migrations/`,
-and they run automatically when the API starts.
+Work on a branch and open a pull request (see [docs/WORKFLOW.md](docs/WORKFLOW.md)). When CI is green and you merge to `main`:
+- Render rebuilds and redeploys the API, but only after the checks pass.
+- The website is rebuilt from the commit CI approved, published, and followed by a `/health` check.
+- Database changes are migrations in `migrations/`, and they run automatically when the API starts.
 
 ## Troubleshooting
 | Symptom | Likely cause |
