@@ -1,0 +1,29 @@
+# Render blueprint for the Tomo API (free plan). See DEPLOY.md for the full walkthrough.
+# `sync: false` means Render asks you for the value in its dashboard instead of reading it from
+# this public file, so no secrets are stored here.
+services:
+  - type: web
+    name: tomo-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    # Deploy a new commit on `main` only after its CI checks (see .github/workflows/ci.yml) pass.
+    autoDeployTrigger: checksPass
+    envVars:
+      # Neon connection string (same one you use locally).
+      - key: DATABASE_URL
+        sync: false
+      # Your website address, e.g. https://tomo.pages.dev  (no trailing slash)
+      - key: FRONTEND_URL
+        sync: false
+      # Websites allowed to call the API. Usually the same as FRONTEND_URL.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # This API's own public address, e.g. https://tomo-api.onrender.com  (no trailing slash)
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      # DEV_AUTH is deliberately NOT set here. Leave it unset in production.

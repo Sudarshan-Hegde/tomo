@@ -12,6 +12,8 @@ pub enum ApiError {
     BadRequest(String),
     Conflict(&'static str),
     NotFound(&'static str),
+    /// A service we depend on (like Steam) is not answering. The person can simply retry.
+    Unavailable(&'static str),
     Internal,
 }
 
@@ -23,7 +25,11 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m.to_string()),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.to_string()),
-            ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.".to_string()),
+            ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.to_string()),
+            ApiError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong.".to_string(),
+            ),
         };
         (status, Json(ErrorBody { error: msg })).into_response()
     }

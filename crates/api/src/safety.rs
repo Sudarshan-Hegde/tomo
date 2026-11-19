@@ -34,9 +34,18 @@ async fn user_exists(db: &sqlx::PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 }
 
 async fn insert_block(db: &sqlx::PgPool, blocker: Uuid, blocked: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-        .bind(blocker)
-        .bind(blocked)
+    sqlx::query(
+        "INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(blocker)
+    .bind(blocked)
+    .execute(db)
+    .await?;
+    // Blocking someone also ends any friendship with them.
+    let (a, b) = crate::friends::ordered(blocker, blocked);
+    sqlx::query("DELETE FROM friendships WHERE user_a = $1 AND user_b = $2")
+        .bind(a)
+        .bind(b)
         .execute(db)
         .await?;
     Ok(())
@@ -101,7 +110,9 @@ pub async fn report(
     }
     let details = req.details.trim();
     if details.chars().count() > 1000 {
-        return Err(ApiError::BadRequest("Details must be 1000 characters or fewer.".into()));
+        return Err(ApiError::BadRequest(
+            "Details must be 1000 characters or fewer.".into(),
+        ));
     }
     if !user_exists(&state.db, req.user_id).await? {
         return Err(ApiError::NotFound("That player does not exist."));
@@ -124,7 +135,9 @@ pub async fn report(
         insert_block(&state.db, uid, req.user_id).await?;
     }
     if inserted == 0 {
-        return Err(ApiError::Conflict("You already have an open report for this player."));
+        return Err(ApiError::Conflict(
+            "You already have an open report for this player.",
+        ));
     }
     Ok(())
 }

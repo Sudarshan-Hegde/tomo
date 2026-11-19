@@ -1,0 +1,83 @@
+name: Build and publish website
+
+# Runs after CI succeeds on `main`, builds the website, and publishes it to the `gh-pages` branch.
+# Cloudflare Pages watches that branch and serves it (see DEPLOY.md). No tokens are needed:
+# GitHub's built-in GITHUB_TOKEN is enough to push to the branch.
+#
+# Because it waits for CI, broken code can never reach the live site.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-website
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    # Skip when CI failed or was cancelled (a manual run always goes ahead), and skip quietly until the
+    # TOMO_API_URL variable exists, so a repo that is not deployed yet shows no red failures.
+    if: >-
+      vars.TOMO_API_URL != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build exactly the commit CI approved, not whatever main has moved on to.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/trunk-action@v0.5.0
+        with:
+          version: "v0.21.14"
+
+      - name: Build
+        working-directory: crates/web
+        env:
+          # Set under: repo Settings -> Secrets and variables -> Actions -> Variables.
+          TOMO_API_URL: ${{ vars.TOMO_API_URL }}
+        run: |
+          if [ -z "$TOMO_API_URL" ]; then
+            echo "::error::Add a repository VARIABLE named TOMO_API_URL (your API address, e.g. https://tomo-api.onrender.com, no trailing slash). See DEPLOY.md."
+            exit 1
+          fi
+          trunk build --release
+
+      - name: Publish to the gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: crates/web/dist
+          publish_branch: gh-pages
+          # Keep the branch a single commit so it never grows.
+          force_orphan: true
+
+      # The API deploys separately (Render, after the same CI checks). Give it time to come up
+      # (a free Render service may be asleep or mid-deploy), then make sure it really answers.
+      - name: Check the API is healthy
+        env:
+          TOMO_API_URL: ${{ vars.TOMO_API_URL }}
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8; do
+            body=$(curl -fsS --max-time 60 "$TOMO_API_URL/health" || true)
+            echo "attempt $attempt: ${body:-no answer}"
+            if echo "$body" | grep -q '"database":true'; then
+              echo "API is up and its database answers."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::The API did not report a healthy database within about 4 minutes."
+          exit 1

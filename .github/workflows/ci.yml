@@ -1,0 +1,47 @@
+name: CI
+
+# The gate every change must pass before it can reach `main` (and therefore production):
+# formatting, lint warnings treated as errors, the unit tests, and a compile of the website.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same branch cancels the older, now pointless, run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint (warnings are errors) - server and shared code
+        run: cargo clippy -p tomo-api -p tomo-shared --all-targets -- -D warnings
+
+      - name: Lint (warnings are errors) - website
+        run: cargo clippy -p tomo-web --target wasm32-unknown-unknown -- -D warnings
+
+      # No database needed: the tests cover ranking, auth helpers, the chat rate limiter,
+      # configuration, and the Discord and Steam clients (against fakes started inside the tests).
+      - name: Unit tests
+        run: cargo test -p tomo-shared -p tomo-api

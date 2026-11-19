@@ -1,0 +1,13 @@
+# Keep the build context small and make sure no secrets can be copied into an image.
+target
+**/target
+node_modules
+.git
+.github
+.neon
+.env
+.env.*
+!.env.example
+crates/web/dist
+crates/web/assets
+*.md

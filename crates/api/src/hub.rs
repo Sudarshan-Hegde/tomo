@@ -26,7 +26,12 @@ impl Hub {
     pub fn register(&self, user: Uuid) -> (u64, Tx, UnboundedReceiver<ServerMsg>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = unbounded_channel();
-        self.conns.lock().unwrap().entry(user).or_default().push((id, tx.clone()));
+        self.conns
+            .lock()
+            .unwrap()
+            .entry(user)
+            .or_default()
+            .push((id, tx.clone()));
         (id, tx, rx)
     }
 

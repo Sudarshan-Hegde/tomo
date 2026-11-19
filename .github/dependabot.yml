@@ -1,0 +1,16 @@
+# Opens a pull request when a dependency has a new version, so updates are small, reviewed and tested
+# by CI instead of piling up. Monthly keeps the noise low for a one-person project.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

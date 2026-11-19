@@ -3,27 +3,67 @@ use std::time::Duration;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
-use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
+use leptos_router::NavigateOptions;
 use tomo_shared::{
-    AuthResponse, ChatHistory, ChatMessage, ClientMsg, DevLoginRequest, DiscoverCard, Me, Profile, ProfileInput,
-    ServerMsg, SwipeRequest, SwipeResponse, MatchedWith, Uuid, AVATARS, GAMES, PLAYSTYLES, RANKS, REGIONS,
+    AuthConfig, AuthResponse, ChatHistory, ChatMessage, ClientMsg, DevLoginRequest, DiscordInfo,
+    DiscoverCard, ExchangeRequest, MatchedWith, Me, Profile, ProfileInput, ServerMsg, SwipeRequest,
+    SwipeResponse, Uuid, AVATARS, PLAYSTYLES, RANKS, REGIONS,
 };
 
-use crate::api::{self, ApiErr, SessionSignal};
-use crate::chat::{fmt_time, now_ms, ChatClient, ChatStatus, TYPING_DISPLAY, TYPING_IDLE, TYPING_RESEND_MS};
-use crate::components::{ApiStatus, Avatar, BlockDialog, ProfileCard, ReportDialog, SignInPrompt};
+use crate::api::{self, ApiErr, NoticeSignal, SessionSignal};
+use crate::chat::{
+    fmt_time, now_ms, ChatClient, ChatStatus, TYPING_DISPLAY, TYPING_IDLE, TYPING_RESEND_MS,
+};
+use crate::components::{
+    ApiStatus, Avatar, BlockDialog, GamePicker, ProfileCard, ReportDialog, SignInPrompt,
+};
+use tomo_shared::{
+    AcceptInviteRequest, AcceptInviteResponse, Friend, Game, InviteInfo, InvitePreview,
+    ServerPerson, ServersStatus,
+};
 
 // ───────────────────────── Landing ─────────────────────────
 
 #[component]
 pub fn Landing() -> impl IntoView {
     let features = [
-        ("🎯", "Rank-bound clans", "Your deck is ranked by shared games, region and rank, so the best allies come first.", true),
-        ("🌙", "Night-owl sync", "Match with players who are awake when you are.", false),
-        ("🎙️", "Voice or silence", "War cry or silent blade. Say what you want up front.", true),
-        ("📜", "Whispered scrolls", "Real-time chat with typing signs and seen marks once a pact is sealed.", true),
-        ("🛡️", "Banish & report", "Block or report anyone. Everyone is 18+, confirmed at sign-up.", true),
-        ("⚔️", "Raise a war band", "Fill a full 5-stack with one click.", false),
+        (
+            "🎯",
+            "Rank-bound clans",
+            "Your deck is ranked by shared games, region and rank, so the best allies come first.",
+            true,
+        ),
+        (
+            "🌙",
+            "Night-owl sync",
+            "Match with players who are awake when you are.",
+            false,
+        ),
+        (
+            "🎙️",
+            "Voice or silence",
+            "War cry or silent blade. Say what you want up front.",
+            true,
+        ),
+        (
+            "📜",
+            "Whispered scrolls",
+            "Real-time chat with typing signs and seen marks once a pact is sealed.",
+            true,
+        ),
+        (
+            "🛡️",
+            "Banish & report",
+            "Block or report anyone. Everyone is 18+, confirmed at sign-up.",
+            true,
+        ),
+        (
+            "⚔️",
+            "Raise a war band",
+            "Fill a full 5-stack with one click.",
+            false,
+        ),
     ];
     view! {
         <section class="hero">
@@ -82,15 +122,58 @@ pub fn Landing() -> impl IntoView {
 
 // ───────────────────────── Login ─────────────────────────
 
+/// Where to go after signing in: new accounts build a profile first, returning ones start hunting.
+async fn landing_after_login(token: &str) -> &'static str {
+    match api::get::<Me>("/me", Some(token)).await {
+        Ok(Me {
+            profile: Some(_), ..
+        }) => "/discover",
+        _ => "/welcome",
+    }
+}
+
+/// If the person arrived through a friend's invite link before signing in, use it now.
+async fn accept_pending_invite(token: &str, notice: NoticeSignal) {
+    let Some(code) = api::take_pending_invite() else {
+        return;
+    };
+    let req = AcceptInviteRequest { code };
+    match api::post::<_, AcceptInviteResponse>("/invites/accept", Some(token), &req).await {
+        Ok(r) if r.already_friends => notice.set(Some(format!(
+            "You and {} are already friends.",
+            r.friend_name
+        ))),
+        Ok(r) => notice.set(Some(format!("You and {} are now friends!", r.friend_name))),
+        // For example "That is your own invite link". Worth showing, never worth blocking sign-in.
+        Err(e) => notice.set(Some(e.text())),
+    }
+}
+
 #[component]
 pub fn Login() -> impl IntoView {
     let session = expect_context::<SessionSignal>();
+    let notice = expect_context::<NoticeSignal>();
+    let servers = RwSignal::new(false); // "also find players from my Discord servers"
     let navigate = use_navigate();
+    let query = use_query_map();
+
+    // Which sign-in methods does this server offer?
+    let methods =
+        LocalResource::new(|| async { api::get::<AuthConfig>("/auth/config", None).await });
+
     let username = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
 
-    let submit = move || {
+    // The server sends people back here with ?error=... if Discord login failed or was cancelled.
+    Effect::new(move |_| {
+        if let Some(msg) = query.read().get("error") {
+            error.set(Some(msg));
+        }
+    });
+
+    // A Callback is Copy, so the reactive view below can hand it to handlers repeatedly.
+    let submit = Callback::new(move |_: ()| {
         if busy.get_untracked() {
             return;
         }
@@ -103,55 +186,175 @@ pub fn Login() -> impl IntoView {
         error.set(None);
         let navigate = navigate.clone();
         spawn_local(async move {
-            let result = api::post::<_, AuthResponse>("/auth/dev", None, &DevLoginRequest { username: name }).await;
+            let result = api::post::<_, AuthResponse>(
+                "/auth/dev",
+                None,
+                &DevLoginRequest { username: name },
+            )
+            .await;
             match result {
                 Ok(auth) => {
-                    let s = api::Session { token: auth.token, user: auth.user };
+                    let s = api::Session {
+                        token: auth.token,
+                        user: auth.user,
+                    };
                     api::store_session(Some(&s));
-                    // New accounts go build a profile first; returning ones go straight to the hunt.
-                    let has_profile = matches!(
-                        api::get::<Me>("/me", Some(&s.token)).await,
-                        Ok(Me { profile: Some(_), .. })
-                    );
+                    let target = landing_after_login(&s.token).await;
+                    accept_pending_invite(&s.token, notice).await;
                     session.set(Some(s));
-                    navigate(if has_profile { "/discover" } else { "/profile" }, Default::default());
+                    navigate(target, Default::default());
                 }
                 Err(e) => error.set(Some(e.text())),
             }
             busy.set(false);
         });
-    };
+    });
 
     view! {
         <section class="center-card">
             <div class="brand-mark huge">"友"</div>
             <h2>"Enter the dojo"</h2>
-            <p class="muted">"Choose a name to save your profile and your pacts."</p>
-            <form
-                class="form"
-                on:submit=move |ev| {
-                    ev.prevent_default();
-                    submit();
-                }
-            >
-                <input
-                    type="text"
-                    placeholder="username"
-                    maxlength="24"
-                    autocomplete="username"
-                    prop:value=move || username.get()
-                    on:input:target=move |ev| username.set(ev.target().value())
-                />
-                <button class="btn primary big" type="submit" disabled=move || busy.get()>
-                    {move || if busy.get() { "Opening the gate…" } else { "Enter" }}
-                </button>
-            </form>
+            <p class="muted">"Sign in to save your profile and your pacts."</p>
+
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
-            <div class="divider"><span>"soon"</span></div>
-            <button class="btn discord big" disabled=true>"Continue with Discord"</button>
-            <p class="hint">
-                "Username sign-in is a development stand-in and will be replaced by Discord."
-            </p>
+
+            {move || match methods.get() {
+                None => view! { <p class="muted">"Checking the gate…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error">{e.text()}</p> }.into_any(),
+                Some(Ok(m)) => {
+                    let discord = if m.discord {
+                        // A normal link, not a fetch: the whole page goes to Discord and comes back.
+                        view! {
+                            <a
+                                class="btn discord big"
+                                href=move || {
+                                    format!("{}/auth/discord{}", api::API_URL, if servers.get() { "?servers=1" } else { "" })
+                                }
+                            >
+                                "Continue with Discord"
+                            </a>
+                            <label class="check servers-opt">
+                                <input
+                                    type="checkbox"
+                                    prop:checked=move || servers.get()
+                                    on:change:target=move |ev| servers.set(ev.target().checked())
+                                />
+                                <span>
+                                    "Also find players from my Discord servers. This asks Discord for your server list (small communities only, and only the names of servers you share are ever shown). You can turn it off any time."
+                                </span>
+                            </label>
+                        }
+                            .into_any()
+                    } else {
+                        view! {
+                            <button class="btn discord big" disabled=true title="Discord sign-in is not set up on this server">
+                                "Continue with Discord"
+                            </button>
+                        }
+                            .into_any()
+                    };
+                    let dev = m.dev.then(|| {
+                        view! {
+                            <div class="divider"><span>"development only"</span></div>
+                            <form
+                                class="form"
+                                on:submit=move |ev| {
+                                    ev.prevent_default();
+                                    submit.run(());
+                                }
+                            >
+                                <input
+                                    type="text"
+                                    placeholder="any username"
+                                    maxlength="24"
+                                    autocomplete="username"
+                                    prop:value=move || username.get()
+                                    on:input:target=move |ev| username.set(ev.target().value())
+                                />
+                                <button class="btn ghost" type="submit" disabled=move || busy.get()>
+                                    {move || if busy.get() { "Opening the gate…" } else { "Enter without Discord" }}
+                                </button>
+                            </form>
+                        }
+                    });
+                    view! {
+                        {discord}
+                        {dev}
+                        {(!m.discord && !m.dev).then(|| view! { <p class="hint">"Sign-in is not available on this server yet."</p> })}
+                    }
+                        .into_any()
+                }
+            }}
+        </section>
+    }
+}
+
+/// Discord sends people back to the site here, carrying a one-time code in the address.
+/// We trade it for a session and tidy the address bar.
+#[component]
+pub fn AuthCallback() -> impl IntoView {
+    let session = expect_context::<SessionSignal>();
+    let notice = expect_context::<NoticeSignal>();
+    let navigate = use_navigate();
+    let query = use_query_map();
+    let error = RwSignal::new(None::<String>);
+
+    Effect::new(move |_| {
+        let Some(code) = query.read().get("code") else {
+            error.set(Some(
+                "The sign-in link is missing its code. Please try again.".into(),
+            ));
+            return;
+        };
+        let navigate = navigate.clone();
+        let next = query.read().get("next");
+        spawn_local(async move {
+            match api::post::<_, AuthResponse>("/auth/exchange", None, &ExchangeRequest { code })
+                .await
+            {
+                Ok(auth) => {
+                    let s = api::Session {
+                        token: auth.token,
+                        user: auth.user,
+                    };
+                    api::store_session(Some(&s));
+                    let target = if next.as_deref() == Some("friends") {
+                        "/friends"
+                    } else {
+                        landing_after_login(&s.token).await
+                    };
+                    accept_pending_invite(&s.token, notice).await;
+                    session.set(Some(s));
+                    // `replace` so the one-time code does not stay in the browser history.
+                    navigate(
+                        target,
+                        NavigateOptions {
+                            replace: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+                Err(e) => error.set(Some(e.text())),
+            }
+        });
+    });
+
+    view! {
+        <section class="center-card">
+            <div class="brand-mark huge">"友"</div>
+            {move || match error.get() {
+                None => view! {
+                    <h2>"Opening the gate…"</h2>
+                    <p class="muted">"Finishing your Discord sign-in."</p>
+                }
+                    .into_any(),
+                Some(e) => view! {
+                    <h2>"Sign-in did not finish"</h2>
+                    <p class="error">{e}</p>
+                    <A href="/login" attr:class="btn primary">"Try again"</A>
+                }
+                    .into_any(),
+            }}
         </section>
     }
 }
@@ -167,6 +370,14 @@ enum Dialog {
 /// Plain-language reasons a card was suggested.
 fn reasons(card: &DiscoverCard) -> Vec<String> {
     let mut r = Vec::new();
+    if card.is_friend {
+        r.push("Your friend".into());
+    }
+    match card.shared_servers.len() {
+        0 => {}
+        1 => r.push(format!("Both in {}", card.shared_servers[0])),
+        n => r.push(format!("{n} shared servers")),
+    }
     match card.shared_games.len() {
         0 => {}
         1 => r.push(format!("Both play {}", card.shared_games[0])),
@@ -209,7 +420,9 @@ fn DiscoverDeck() -> impl IntoView {
     let dialog = RwSignal::new(None::<Dialog>);
 
     let load = move || {
-        let Some(s) = session.get_untracked() else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
         loading.set(true);
         error.set(None);
         spawn_local(async move {
@@ -231,14 +444,22 @@ fn DiscoverDeck() -> impl IntoView {
     let remaining = move || deck.with(|d| d.len()).saturating_sub(idx.get());
 
     let swipe = move |like: bool| {
-        if anim.get_untracked().is_some() || matched.get_untracked().is_some() || dialog.get_untracked().is_some() {
+        if anim.get_untracked().is_some()
+            || matched.get_untracked().is_some()
+            || dialog.get_untracked().is_some()
+        {
             return;
         }
         let Some(card) = current() else { return };
-        let Some(s) = session.get_untracked() else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
         anim.set(Some(like));
         spawn_local(async move {
-            let req = SwipeRequest { target_id: card.profile.user_id, liked: like };
+            let req = SwipeRequest {
+                target_id: card.profile.user_id,
+                liked: like,
+            };
             match api::post::<_, SwipeResponse>("/swipe", Some(&s.token), &req).await {
                 Ok(r) => {
                     if let Some(m) = r.matched {
@@ -366,7 +587,7 @@ fn DiscoverDeck() -> impl IntoView {
                                 <h2>"You and " {p.display_name.clone()} " fight well together"</h2>
                                 <div class="pair">
                                     <span class="spark">"✦"</span>
-                                    <Avatar emoji=p.avatar.clone() hue=p.hue big=true />
+                                    <Avatar emoji=p.avatar.clone() hue=p.hue big=true image=p.avatar_url.clone() />
                                     <span class="spark">"✦"</span>
                                 </div>
                                 <div class="row">
@@ -430,7 +651,7 @@ pub fn Matches() -> impl IntoView {
                                 let has_unread = unread > 0;
                                 view! {
                                     <A href=format!("/chat/{id}") attr:class="row-item">
-                                        <Avatar emoji=p.avatar.clone() hue=p.hue />
+                                        <Avatar emoji=p.avatar.clone() hue=p.hue image=p.avatar_url.clone() />
                                         <div class="grow">
                                             <b>{p.display_name.clone()}</b>
                                             <p class="muted preview" class:strong=has_unread>{preview}</p>
@@ -510,11 +731,16 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
     let last_marked = StoredValue::new(0i64);
     let newest_seen = StoredValue::new(0i64);
 
-    let summary = move || chat.matches.with(|m| m.iter().find(|x| x.match_id == match_id).cloned());
+    let summary = move || {
+        chat.matches
+            .with(|m| m.iter().find(|x| x.match_id == match_id).cloned())
+    };
 
     // ── history ──
     let load = move || {
-        let Some(s) = session.get_untracked() else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
         spawn_local(async move {
             let path = format!("/matches/{match_id}/messages");
             match api::get::<ChatHistory>(&path, Some(&s.token)).await {
@@ -532,8 +758,12 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
     Effect::new(move |_| load());
 
     let load_older = move || {
-        let Some(s) = session.get_untracked() else { return };
-        let Some(first) = messages.with_untracked(|v| v.first().map(|m| m.id)) else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
+        let Some(first) = messages.with_untracked(|v| v.first().map(|m| m.id)) else {
+            return;
+        };
         spawn_local(async move {
             let path = format!("/matches/{match_id}/messages?before={first}");
             match api::get::<ChatHistory>(&path, Some(&s.token)).await {
@@ -541,7 +771,7 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
                     has_more.set(h.has_more);
                     messages.update(|v| {
                         let mut older = h.messages;
-                        older.extend(v.drain(..));
+                        older.append(v);
                         *v = older;
                     });
                 }
@@ -553,9 +783,15 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
     // ── "seen": tell the server whenever I can see their newest message ──
     Effect::new(move |_| {
         let online = chat.status.get() == ChatStatus::Online;
-        let newest_theirs = messages.with(|v| v.iter().rev().find(|m| m.sender_id != me).map(|m| m.id));
+        let newest_theirs =
+            messages.with(|v| v.iter().rev().find(|m| m.sender_id != me).map(|m| m.id));
         if let (true, Some(id)) = (online, newest_theirs) {
-            if id > last_marked.get_value() && chat.send(ClientMsg::Read { match_id, up_to: id }) {
+            if id > last_marked.get_value()
+                && chat.send(ClientMsg::Read {
+                    match_id,
+                    up_to: id,
+                })
+            {
                 last_marked.set_value(id);
                 chat.clear_unread(match_id);
             }
@@ -575,7 +811,11 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
                 typing.set(false);
             }
         }
-        ServerMsg::Typing { match_id: mid, user_id, typing: is_typing } if *mid == match_id && *user_id != me => {
+        ServerMsg::Typing {
+            match_id: mid,
+            user_id,
+            typing: is_typing,
+        } if *mid == match_id && *user_id != me => {
             typing.set(*is_typing);
             if *is_typing {
                 // Typing signals expire on their own in case the "stopped" signal is lost.
@@ -591,7 +831,11 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
                 );
             }
         }
-        ServerMsg::Read { match_id: mid, user_id, up_to } if *mid == match_id && *user_id != me => {
+        ServerMsg::Read {
+            match_id: mid,
+            user_id,
+            up_to,
+        } if *mid == match_id && *user_id != me => {
             other_read.update(|x| *x = (*x).max(*up_to));
         }
         ServerMsg::Error { message } => error.set(Some(message.clone())),
@@ -616,7 +860,10 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
     let stop_typing = move || {
         if last_typing_sent.get_value() > 0.0 {
             last_typing_sent.set_value(0.0);
-            chat.send(ClientMsg::Typing { match_id, typing: false });
+            chat.send(ClientMsg::Typing {
+                match_id,
+                typing: false,
+            });
         }
     };
     let on_input = move |value: String| {
@@ -629,7 +876,10 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
         let now = now_ms();
         if now - last_typing_sent.get_value() > TYPING_RESEND_MS {
             last_typing_sent.set_value(now);
-            chat.send(ClientMsg::Typing { match_id, typing: true });
+            chat.send(ClientMsg::Typing {
+                match_id,
+                typing: true,
+            });
         }
         idle_gen.update_value(|g| *g += 1);
         let g = idle_gen.get_value();
@@ -647,7 +897,10 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
         if text.trim().is_empty() {
             return;
         }
-        if chat.send(ClientMsg::Send { match_id, body: text }) {
+        if chat.send(ClientMsg::Send {
+            match_id,
+            body: text,
+        }) {
             draft.set(String::new());
             last_typing_sent.set_value(0.0);
             idle_gen.update_value(|g| *g += 1);
@@ -671,10 +924,10 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
                         summary()
                             .map(|s| {
                                 view! {
-                                    <Avatar emoji=s.profile.avatar.clone() hue=s.profile.hue />
+                                    <Avatar emoji=s.profile.avatar.clone() hue=s.profile.hue image=s.profile.avatar_url.clone() />
                                     <div class="grow">
                                         <b>{s.profile.display_name.clone()}</b>
-                                        <p class="muted">{s.profile.games.join(" · ")}</p>
+                                        <p class="muted">{s.profile.games.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(", ")}</p>
                                     </div>
                                 }
                             })
@@ -726,7 +979,7 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
                             .map(|m| {
                                 let mine = m.sender_id == me;
                                 let status = (mine && Some(m.id) == last_mine)
-                                    .then(|| if m.id <= read { " · Seen ✓✓" } else { " · Sent ✓" });
+                                    .then_some(if m.id <= read { " · Seen ✓✓" } else { " · Sent ✓" });
                                 view! {
                                     <div class="msg" class:mine=mine>
                                         <div class="bubble" class:mine=mine>{m.body.clone()}</div>
@@ -806,9 +1059,24 @@ fn ChatRoom(match_id: Uuid, me: Uuid) -> impl IntoView {
 
 // ───────────────────────── Profile editor ─────────────────────────
 
+/// Edit your profile.
 #[component]
 pub fn ProfileEdit() -> impl IntoView {
+    view! { <ProfileEditor /> }
+}
+
+/// First stop for a brand-new account: the same form, introduced as a welcome.
+#[component]
+pub fn Welcome() -> impl IntoView {
+    view! { <ProfileEditor welcome=true /> }
+}
+
+#[component]
+fn ProfileEditor(#[prop(optional)] welcome: bool) -> impl IntoView {
     let session = expect_context::<SessionSignal>();
+    let navigate = use_navigate();
+    let discord = RwSignal::new(None::<DiscordInfo>); // who Discord says you are, if you signed in with it
+    let use_discord = RwSignal::new(false); // show the Discord picture instead of the emoji
 
     let name = RwSignal::new(String::new());
     let bio = RwSignal::new(String::new());
@@ -818,7 +1086,7 @@ pub fn ProfileEdit() -> impl IntoView {
     let region = RwSignal::new(REGIONS[0].to_string());
     let style = RwSignal::new(PLAYSTYLES[0].to_string());
     let mic = RwSignal::new(true);
-    let games = RwSignal::new(Vec::<String>::new());
+    let games = RwSignal::new(Vec::<Game>::new());
     let adult = RwSignal::new(false); // the 18+ checkbox
     let already_adult = RwSignal::new(false); // confirmed earlier on this account
 
@@ -835,8 +1103,10 @@ pub fn ProfileEdit() -> impl IntoView {
             match api::get::<Me>("/me", Some(&s.token)).await {
                 Ok(me) => {
                     already_adult.set(me.adult_confirmed);
+                    discord.set(me.discord.clone());
                     match me.profile {
                         Some(p) => {
+                            use_discord.set(p.avatar_url.is_some());
                             name.set(p.display_name);
                             bio.set(p.bio);
                             avatar.set(p.avatar);
@@ -847,7 +1117,16 @@ pub fn ProfileEdit() -> impl IntoView {
                             mic.set(p.mic);
                             games.set(p.games);
                         }
-                        None => name.set(me.user.username),
+                        None => {
+                            // First time here: start from what Discord gave us.
+                            use_discord.set(me.discord.is_some());
+                            name.set(
+                                me.discord
+                                    .as_ref()
+                                    .map(|d| d.display_name.clone())
+                                    .unwrap_or(me.user.username),
+                            );
+                        }
                     }
                     loaded.set(true);
                 }
@@ -861,19 +1140,22 @@ pub fn ProfileEdit() -> impl IntoView {
         bio: bio.get(),
         avatar: avatar.get(),
         hue: hue.get(),
-        games: games.get(),
+        games: games.with(|g| g.iter().map(|x| x.app_id).collect()),
         rank: rank.get(),
         region: region.get(),
         playstyle: style.get(),
         mic: mic.get(),
         adult_confirmed: adult.get() || already_adult.get(),
+        use_discord_avatar: use_discord.get() && discord.with(|d| d.is_some()),
     };
 
-    let save = move || {
+    let save = Callback::new(move |_: ()| {
         if saving.get_untracked() {
             return;
         }
-        let Some(s) = session.get_untracked() else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
         let body = input();
         if let Err(msg) = body.validate() {
             error.set(Some(msg));
@@ -885,10 +1167,15 @@ pub fn ProfileEdit() -> impl IntoView {
         }
         error.set(None);
         saving.set(true);
+        let navigate = navigate.clone();
         spawn_local(async move {
             match api::put::<_, Profile>("/me/profile", Some(&s.token), &body).await {
                 Ok(_) => {
                     already_adult.set(true);
+                    if welcome {
+                        // First profile done: off to find teammates.
+                        navigate("/discover", Default::default());
+                    }
                     saved.set(true);
                     set_timeout(move || saved.set(false), Duration::from_millis(2500));
                 }
@@ -896,7 +1183,7 @@ pub fn ProfileEdit() -> impl IntoView {
             }
             saving.set(false);
         });
-    };
+    });
 
     let select = |label: &'static str, sig: RwSignal<String>, options: &'static [&'static str]| {
         view! {
@@ -917,9 +1204,18 @@ pub fn ProfileEdit() -> impl IntoView {
 
     let preview = move || Profile {
         user_id: Uuid::nil(),
-        display_name: if name.get().trim().is_empty() { "Your name".into() } else { name.get() },
+        display_name: if name.get().trim().is_empty() {
+            "Your name".into()
+        } else {
+            name.get()
+        },
         bio: bio.get(),
         avatar: avatar.get(),
+        avatar_url: if use_discord.get() {
+            discord.get().map(|d| d.avatar_url)
+        } else {
+            None
+        },
         hue: hue.get(),
         games: games.get(),
         rank: rank.get(),
@@ -930,7 +1226,9 @@ pub fn ProfileEdit() -> impl IntoView {
 
     view! {
         <section class="page">
-            <div class="page-head"><h2>"Your profile"</h2></div>
+            <div class="page-head">
+                <h2>{move || if welcome { format!("Welcome, {}", name.get()) } else { "Your profile".to_string() }}</h2>
+            </div>
             {move || {
                 if session.get().is_none() {
                     return view! { <SignInPrompt what="forge your profile" /> }.into_any();
@@ -939,12 +1237,18 @@ pub fn ProfileEdit() -> impl IntoView {
                     return view! { <p class="muted">"Unrolling your scroll…"</p> }.into_any();
                 }
                 view! {
+                    {(welcome && discord.get().is_some()).then(|| view! {
+                        <div class="welcome-note">
+                            <p class="eyebrow">"From Discord"</p>
+                            <p>"We brought in your name and picture. Discord does not share which games you play or who your friends are with apps, so pick your games from Steam below. To bring friends along, use your invite link on the Friends page. Everything here can be changed later."</p>
+                        </div>
+                    })}
                     <div class="editor">
                         <form
                             class="form"
                             on:submit=move |ev| {
                                 ev.prevent_default();
-                                save();
+                                save.run(());
                             }
                         >
                             <label class="field">
@@ -966,6 +1270,23 @@ pub fn ProfileEdit() -> impl IntoView {
                                     on:input:target=move |ev| bio.set(ev.target().value())
                                 ></textarea>
                             </label>
+                            {move || {
+                                discord
+                                    .get()
+                                    .map(|d| {
+                                        view! {
+                                            <label class="check discord-avatar">
+                                                <img class="da-img" src=d.avatar_url.clone() alt="" referrerpolicy="no-referrer" />
+                                                <input
+                                                    type="checkbox"
+                                                    prop:checked=move || use_discord.get()
+                                                    on:change:target=move |ev| use_discord.set(ev.target().checked())
+                                                />
+                                                <span>"Use my Discord avatar"</span>
+                                            </label>
+                                        }
+                                    })
+                            }}
                             <div class="field">
                                 <span>"Emblem"</span>
                                 <div class="chips">
@@ -1003,33 +1324,8 @@ pub fn ProfileEdit() -> impl IntoView {
                             </div>
                             {select("Region", region, &REGIONS)}
                             <div class="field">
-                                <span>"Arenas you fight in"</span>
-                                <div class="chips">
-                                    {GAMES
-                                        .iter()
-                                        .map(|g| {
-                                            let g = *g;
-                                            view! {
-                                                <button
-                                                    type="button"
-                                                    class="chip pick"
-                                                    class:on=move || games.get().iter().any(|x| x == g)
-                                                    on:click=move |_| {
-                                                        games.update(|v| {
-                                                            if let Some(i) = v.iter().position(|x| x == g) {
-                                                                v.remove(i);
-                                                            } else {
-                                                                v.push(g.to_string());
-                                                            }
-                                                        })
-                                                    }
-                                                >
-                                                    {g}
-                                                </button>
-                                            }
-                                        })
-                                        .collect_view()}
-                                </div>
+                                <span>"Games you play (from Steam)"</span>
+                                <GamePicker selected=games />
                             </div>
                             <label class="check">
                                 <input
@@ -1059,7 +1355,7 @@ pub fn ProfileEdit() -> impl IntoView {
                             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                             <div class="row">
                                 <button class="btn primary" type="submit" disabled=move || saving.get()>
-                                    {move || if saving.get() { "Saving…" } else { "Save profile" }}
+                                    {move || if saving.get() { "Saving…" } else if welcome { "Enter the arena" } else { "Save profile" }}
                                 </button>
                                 {move || saved.get().then(|| view! { <span class="saved">"✓ Saved"</span> })}
                             </div>
@@ -1100,7 +1396,9 @@ fn BlockedList() -> impl IntoView {
     });
 
     let unblock = move |id: Uuid| {
-        let Some(s) = session.get_untracked() else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
         spawn_local(async move {
             match api::delete_unit(&format!("/blocks/{id}"), Some(&s.token)).await {
                 Ok(()) => {
@@ -1129,7 +1427,7 @@ fn BlockedList() -> impl IntoView {
                                     let id = p.user_id;
                                     view! {
                                         <div class="row-item static">
-                                            <Avatar emoji=p.avatar.clone() hue=p.hue />
+                                            <Avatar emoji=p.avatar.clone() hue=p.hue image=p.avatar_url.clone() />
                                             <div class="grow"><b>{p.display_name.clone()}</b></div>
                                             <button class="btn small ghost" on:click=move |_| unblock(id)>"Unblock"</button>
                                         </div>
@@ -1155,6 +1453,337 @@ pub fn NotFound() -> impl IntoView {
             <h2>"Lost in the lobby"</h2>
             <p class="muted">"That page doesn't exist."</p>
             <A href="/" attr:class="btn primary">"Back home"</A>
+        </section>
+    }
+}
+
+// ───────────────────────── Friends ─────────────────────────
+
+/// Fetch something from the API whenever the session or `version` changes.
+fn fetch_resource<T: serde::de::DeserializeOwned + 'static>(
+    session: SessionSignal,
+    version: RwSignal<u32>,
+    path: &'static str,
+) -> LocalResource<Result<T, ApiErr>> {
+    LocalResource::new(move || {
+        version.get();
+        let token = session.get().map(|s| s.token);
+        async move {
+            match token {
+                Some(t) => api::get::<T>(path, Some(&t)).await,
+                None => Err(ApiErr::Unauthorized),
+            }
+        }
+    })
+}
+
+#[component]
+pub fn Friends() -> impl IntoView {
+    let session = expect_context::<SessionSignal>();
+    view! {
+        <section class="page">
+            <div class="page-head"><h2>"Friends"</h2></div>
+            {move || match session.get() {
+                None => view! { <SignInPrompt what="bring your friends" /> }.into_any(),
+                Some(_) => view! { <FriendsContent /> }.into_any(),
+            }}
+        </section>
+    }
+}
+
+#[component]
+fn FriendsContent() -> impl IntoView {
+    let session = expect_context::<SessionSignal>();
+    let refresh = RwSignal::new(0u32);
+    let me = fetch_resource::<Me>(session, refresh, "/me");
+    let invite = fetch_resource::<InviteInfo>(session, refresh, "/me/invite");
+    let friends = fetch_resource::<Vec<Friend>>(session, refresh, "/friends");
+    let servers = fetch_resource::<ServersStatus>(session, refresh, "/me/servers");
+    let people = fetch_resource::<Vec<ServerPerson>>(session, refresh, "/servers/people");
+    let copied = RwSignal::new(None::<bool>);
+    let error = RwSignal::new(None::<String>);
+
+    let copy = move |url: String| {
+        spawn_local(async move {
+            let ok = api::copy_to_clipboard(&url).await;
+            copied.set(Some(ok));
+            set_timeout(move || copied.set(None), Duration::from_secs(4));
+        });
+    };
+
+    let unfriend = move |id: Uuid| {
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
+        spawn_local(async move {
+            match api::delete_unit(&format!("/friends/{id}"), Some(&s.token)).await {
+                Ok(()) => refresh.update(|v| *v += 1),
+                Err(e) => error.set(Some(api::handle_err(session, e))),
+            }
+        });
+    };
+
+    let stop_sharing = move |_| {
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
+        spawn_local(async move {
+            match api::delete_unit("/me/servers", Some(&s.token)).await {
+                Ok(()) => refresh.update(|v| *v += 1),
+                Err(e) => error.set(Some(api::handle_err(session, e))),
+            }
+        });
+    };
+
+    view! {
+        {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+
+        <div class="panel">
+            <h3>"Bring your friends"</h3>
+            <p class="muted">
+                "Anyone who joins through your link becomes your friend, and you show up near the top of each other's Discover deck."
+            </p>
+            {move || match invite.get() {
+                None => view! { <p class="muted">"Making your link…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error">{e.text()}</p> }.into_any(),
+                Some(Ok(i)) => {
+                    let url = i.url.clone();
+                    view! {
+                        <div class="copy-row">
+                            <input
+                                type="text"
+                                readonly=true
+                                prop:value=url.clone()
+                                on:focus:target=move |ev| ev.target().select()
+                            />
+                            <button class="btn primary" on:click=move |_| copy(url.clone())>"Copy link"</button>
+                        </div>
+                        {move || {
+                            copied
+                                .get()
+                                .map(|ok| {
+                                    let class = if ok { "saved" } else { "error" };
+                                    let text = if ok {
+                                        "Link copied. Send it to a friend."
+                                    } else {
+                                        "Could not copy automatically. Select the link and press Ctrl+C."
+                                    };
+                                    view! { <p class=class>{text}</p> }
+                                })
+                        }}
+                    }
+                        .into_any()
+                }
+            }}
+        </div>
+
+        <div class="panel">
+            <h3>"Your friends"</h3>
+            {move || match friends.get() {
+                None => view! { <p class="muted">"Gathering your friends…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error">{e.text()}</p> }.into_any(),
+                Some(Ok(v)) if v.is_empty() => {
+                    view! { <p class="muted">"No friends here yet. Share your link above and they will appear."</p> }.into_any()
+                }
+                Some(Ok(v)) => {
+                    view! {
+                        <div class="list">
+                            {v
+                                .into_iter()
+                                .map(|f| {
+                                    let id = f.profile.user_id;
+                                    let p = f.profile;
+                                    let games = p.games.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(", ");
+                                    view! {
+                                        <div class="row-item static">
+                                            <Avatar emoji=p.avatar.clone() hue=p.hue image=p.avatar_url.clone() />
+                                            <div class="grow">
+                                                <b>{p.display_name.clone()}</b>
+                                                <p class="muted preview">{games}</p>
+                                            </div>
+                                            <button class="btn small ghost" on:click=move |_| unfriend(id)>"Unfriend"</button>
+                                        </div>
+                                    }
+                                })
+                                .collect_view()}
+                        </div>
+                    }
+                        .into_any()
+                }
+            }}
+        </div>
+
+        <div class="panel">
+            <h3>"Players from your Discord servers"</h3>
+            {move || match (me.get(), servers.get()) {
+                (Some(Ok(m)), Some(Ok(st))) => {
+                    if m.discord.is_none() {
+                        return view! {
+                            <p class="muted">"Sign in with Discord to find players from the servers you are in."</p>
+                        }
+                            .into_any();
+                    }
+                    if !st.connected {
+                        return view! {
+                            <p class="muted">
+                                "Find Tomo players who are in the same Discord communities as you. This is optional and off until you turn it on."
+                            </p>
+                            <ul class="plain-list">
+                                <li>"Tomo asks Discord for your server list, once, when you connect."</li>
+                                <li>"Only small communities count (2,000 members or fewer)."</li>
+                                <li>"Other people only ever see the names of servers you both are in."</li>
+                                <li>"You can stop sharing at any time, which deletes what we stored."</li>
+                            </ul>
+                            <a class="btn discord big" href=format!("{}/auth/discord?servers=1", api::API_URL)>
+                                "Connect my Discord servers"
+                            </a>
+                        }
+                            .into_any();
+                    }
+                    let shared = st
+                        .servers
+                        .iter()
+                        .map(|s| view! { <span class="chip">{s.clone()}</span> })
+                        .collect_view();
+                    let list = match people.get() {
+                        None => view! { <p class="muted">"Looking for people…"</p> }.into_any(),
+                        Some(Err(e)) => view! { <p class="error">{e.text()}</p> }.into_any(),
+                        Some(Ok(v)) if v.is_empty() => {
+                            view! {
+                                <p class="muted">
+                                    "No one else from your servers is on Tomo yet. Invite them with your link above."
+                                </p>
+                            }
+                                .into_any()
+                        }
+                        Some(Ok(v)) => {
+                            view! {
+                                <div class="list">
+                                    {v
+                                        .into_iter()
+                                        .map(|sp| {
+                                            let p = sp.profile;
+                                            let chips = sp
+                                                .shared_servers
+                                                .iter()
+                                                .map(|s| view! { <span class="why-chip">{s.clone()}</span> })
+                                                .collect_view();
+                                            view! {
+                                                <div class="row-item static">
+                                                    <Avatar emoji=p.avatar.clone() hue=p.hue image=p.avatar_url.clone() />
+                                                    <div class="grow">
+                                                        <b>{p.display_name.clone()}</b>
+                                                        <div class="chips">{chips}</div>
+                                                    </div>
+                                                </div>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                    };
+                    view! {
+                        <p class="muted">"You are sharing these small servers:"</p>
+                        <div class="chips">{shared}</div>
+                        <div class="row">
+                            <button class="btn small ghost" on:click=stop_sharing>"Stop sharing"</button>
+                        </div>
+                        <h4 class="sub">"Also here"</h4>
+                        {list}
+                    }
+                        .into_any()
+                }
+                (Some(Err(e)), _) | (_, Some(Err(e))) => view! { <p class="error">{e.text()}</p> }.into_any(),
+                _ => view! { <p class="muted">"Checking your Discord…"</p> }.into_any(),
+            }}
+        </div>
+    }
+}
+
+/// A friend's invite link: shows who invited you and, once you are signed in, makes you friends.
+#[component]
+pub fn Invite() -> impl IntoView {
+    let session = expect_context::<SessionSignal>();
+    let notice = expect_context::<NoticeSignal>();
+    let navigate = use_navigate();
+    let params = use_params_map();
+    let code = move || params.read().get("code").unwrap_or_default();
+
+    let preview = LocalResource::new(move || {
+        let c = code();
+        async move { api::get::<InvitePreview>(&format!("/invites/{c}"), None).await }
+    });
+
+    // Not signed in yet: remember the link so it is used right after signing in.
+    Effect::new(move |_| {
+        if session.get().is_none() && matches!(preview.get(), Some(Ok(_))) {
+            api::store_pending_invite(&code());
+        }
+    });
+
+    // Already signed in: use the link straight away.
+    let used = StoredValue::new(false);
+    Effect::new(move |_| {
+        let Some(s) = session.get() else { return };
+        if used.get_value() {
+            return;
+        }
+        used.set_value(true);
+        let c = code();
+        let navigate = navigate.clone();
+        spawn_local(async move {
+            let req = AcceptInviteRequest { code: c };
+            match api::post::<_, AcceptInviteResponse>("/invites/accept", Some(&s.token), &req)
+                .await
+            {
+                Ok(r) if r.already_friends => notice.set(Some(format!(
+                    "You and {} are already friends.",
+                    r.friend_name
+                ))),
+                Ok(r) => notice.set(Some(format!("You and {} are now friends!", r.friend_name))),
+                Err(e) => notice.set(Some(api::handle_err(session, e))),
+            }
+            navigate("/friends", Default::default());
+        });
+    });
+
+    view! {
+        <section class="center-card">
+            {move || match preview.get() {
+                None => view! { <p class="muted">"Opening your invite…"</p> }.into_any(),
+                Some(Err(_)) => {
+                    view! {
+                        <div class="brand-mark huge">"迷"</div>
+                        <h2>"This invite link is not valid"</h2>
+                        <p class="muted">"Ask your friend to send a fresh one."</p>
+                        <A href="/" attr:class="btn primary">"Back home"</A>
+                    }
+                        .into_any()
+                }
+                Some(Ok(p)) => {
+                    let emoji = p.inviter_emoji.clone().unwrap_or_else(|| "🥷".to_string());
+                    let name = p.inviter_name.clone();
+                    view! {
+                        <Avatar emoji=emoji hue=210 big=true image=p.inviter_avatar_url.clone() />
+                        <h2>{name.clone()} " invited you to Tomo"</h2>
+                        <p class="muted">
+                            "Find teammates by rank, region and the games you share. Join and you will be friends with "
+                            {name}
+                            " straight away."
+                        </p>
+                        {move || {
+                            if session.get().is_some() {
+                                view! { <p class="muted">"Adding your friend…"</p> }.into_any()
+                            } else {
+                                view! { <A href="/login" attr:class="btn primary big">"Sign in to accept"</A> }.into_any()
+                            }
+                        }}
+                    }
+                        .into_any()
+                }
+            }}
         </section>
     }
 }

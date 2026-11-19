@@ -1,7 +1,8 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_navigate;
-use tomo_shared::{BlockRequest, Health, Profile, ReportRequest, REPORT_REASONS};
+use std::time::Duration;
+use tomo_shared::{BlockRequest, Game, Health, Profile, ReportRequest, MAX_GAMES, REPORT_REASONS};
 
 use crate::api::{self, Session};
 use crate::chat::ChatClient;
@@ -45,11 +46,23 @@ pub fn BackgroundArt() -> impl IntoView {
     }
 }
 
+/// A round avatar: the person's picture if they have one (their Discord avatar), else their emoji.
 #[component]
-pub fn Avatar(emoji: String, hue: u16, #[prop(optional)] big: bool) -> impl IntoView {
+pub fn Avatar(
+    emoji: String,
+    hue: u16,
+    #[prop(optional)] big: bool,
+    #[prop(into, default = None)] image: Option<String>,
+) -> impl IntoView {
+    let content = match image {
+        Some(url) => {
+            view! { <img src=url alt="" referrerpolicy="no-referrer" loading="lazy" /> }.into_any()
+        }
+        None => emoji.into_any(),
+    };
     view! {
         <div class="avatar" class:big=big style=format!("--h:{hue}")>
-            {emoji}
+            {content}
         </div>
     }
 }
@@ -124,6 +137,7 @@ pub fn Navbar() -> impl IntoView {
                         (n > 0).then(|| view! { <span class="badge">{if n > 99 { "99+".to_string() } else { n.to_string() }}</span> })
                     }}
                 </A>
+                <A href="/friends">"Friends"</A>
                 <A href="/profile">"Profile"</A>
             </nav>
             <div class="nav-right">
@@ -145,10 +159,20 @@ pub fn Navbar() -> impl IntoView {
 
 #[component]
 pub fn ProfileCard(profile: Profile, #[prop(optional)] reasons: Vec<String>) -> impl IntoView {
+    // Each game shows its Steam banner as a small thumbnail. A missing banner just hides itself.
     let games = profile
         .games
         .iter()
-        .map(|g| view! { <span class="chip">{g.clone()}</span> })
+        .take(8)
+        .map(|g| {
+            let banner = g.banner_url();
+            view! {
+                <span class="chip game">
+                    <img class="gthumb" src=banner alt="" loading="lazy" on:error:target=move |ev| ev.target().set_hidden(true) />
+                    {g.name.clone()}
+                </span>
+            }
+        })
         .collect_view();
     let why = (!reasons.is_empty()).then(|| {
         view! {
@@ -161,7 +185,7 @@ pub fn ProfileCard(profile: Profile, #[prop(optional)] reasons: Vec<String>) -> 
     view! {
         <div class="pcard-body">
             <div class="pcard-top">
-                <Avatar emoji=profile.avatar.clone() hue=profile.hue big=true />
+                <Avatar emoji=profile.avatar.clone() hue=profile.hue big=true image=profile.avatar_url.clone() />
                 <div>
                     <h3>{profile.display_name.clone()}</h3>
                     <p class="muted">{profile.playstyle.clone()}</p>
@@ -202,7 +226,9 @@ pub fn BlockDialog(target: Profile, on_close: Callback<bool>) -> impl IntoView {
     let id = target.user_id;
 
     let confirm = move |_| {
-        let Some(s) = session.get_untracked() else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
         busy.set(true);
         error.set(None);
         leptos::task::spawn_local(async move {
@@ -254,7 +280,9 @@ pub fn ReportDialog(target: Profile, on_close: Callback<bool>) -> impl IntoView 
     let id = target.user_id;
 
     let submit = move |_| {
-        let Some(s) = session.get_untracked() else { return };
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
         busy.set(true);
         error.set(None);
         let req = ReportRequest {
@@ -340,5 +368,209 @@ pub fn ReportDialog(target: Profile, on_close: Callback<bool>) -> impl IntoView 
                 }}
             </div>
         </div>
+    }
+}
+
+/// Pick up to MAX_GAMES games from all of Steam: a "popular right now" shelf plus live search.
+/// Every tile shows the game's Steam banner.
+#[component]
+pub fn GamePicker(selected: RwSignal<Vec<Game>>) -> impl IntoView {
+    let session = expect_context::<RwSignal<Option<Session>>>();
+    let query = RwSignal::new(String::new());
+    let shelf = RwSignal::new(Vec::<Game>::new()); // what the grid currently shows
+    let popular = RwSignal::new(Vec::<Game>::new());
+    let heading = RwSignal::new("Popular on Steam right now".to_string());
+    let loading = RwSignal::new(true);
+    let error = RwSignal::new(None::<String>);
+    let limit_note = RwSignal::new(false);
+    // Bumped on every keystroke, so a slow, older search can never overwrite a newer one.
+    let search_gen = StoredValue::new(0u64);
+
+    Effect::new(move |_| {
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
+        leptos::task::spawn_local(async move {
+            match api::get::<Vec<Game>>("/games/popular", Some(&s.token)).await {
+                Ok(v) => {
+                    popular.set(v.clone());
+                    if query.get_untracked().trim().is_empty() {
+                        shelf.set(v);
+                    }
+                }
+                Err(e) => error.set(Some(api::handle_err(session, e))),
+            }
+            loading.set(false);
+        });
+    });
+
+    let search = move |q: String| {
+        let q = q.trim().to_string();
+        search_gen.update_value(|g| *g += 1);
+        let generation = search_gen.get_value();
+        if q.chars().count() < 2 {
+            shelf.set(popular.get_untracked());
+            heading.set("Popular on Steam right now".into());
+            loading.set(false);
+            return;
+        }
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
+        loading.set(true);
+        error.set(None);
+        leptos::task::spawn_local(async move {
+            let encoded = js_sys::encode_uri_component(&q)
+                .as_string()
+                .unwrap_or_default();
+            let result =
+                api::get::<Vec<Game>>(&format!("/games/search?q={encoded}"), Some(&s.token)).await;
+            if search_gen.get_value() != generation {
+                return; // the person kept typing; a newer search owns the grid now
+            }
+            match result {
+                Ok(v) => {
+                    heading.set(format!("Results for \"{q}\""));
+                    shelf.set(v);
+                }
+                Err(e) => error.set(Some(api::handle_err(session, e))),
+            }
+            loading.set(false);
+        });
+    };
+
+    let on_input = move |value: String| {
+        query.set(value.clone());
+        search_gen.update_value(|g| *g += 1);
+        let generation = search_gen.get_value();
+        // Wait for a pause in typing before asking Steam.
+        set_timeout(
+            move || {
+                if search_gen.get_value() == generation {
+                    search(value.clone());
+                }
+            },
+            Duration::from_millis(350),
+        );
+    };
+
+    let toggle = move |game: Game| {
+        limit_note.set(false);
+        selected.update(|v| {
+            if let Some(i) = v.iter().position(|g| g.app_id == game.app_id) {
+                v.remove(i);
+            } else if v.len() < MAX_GAMES {
+                v.push(game);
+            } else {
+                limit_note.set(true);
+            }
+        });
+    };
+
+    view! {
+        <div class="picker">
+            <div class="picked">
+                {move || {
+                    let list = selected.get();
+                    if list.is_empty() {
+                        return view! { <p class="muted">"Nothing picked yet. Search below, or tap a game."</p> }.into_any();
+                    }
+                    list.into_iter()
+                        .map(|g| {
+                            let banner = g.banner_url();
+                            let name = g.name.clone();
+                            view! {
+                                <button type="button" class="picked-game" title="Remove" on:click=move |_| toggle(g.clone())>
+                                    <img src=banner alt="" loading="lazy" on:error:target=move |ev| ev.target().set_hidden(true) />
+                                    <span>{name}</span>
+                                    <b>"✕"</b>
+                                </button>
+                            }
+                        })
+                        .collect_view()
+                        .into_any()
+                }}
+            </div>
+            <p class="muted count">{move || format!("{} of {} picked", selected.with(|v| v.len()), MAX_GAMES)}</p>
+            {move || limit_note.get().then(|| view! { <p class="error">{format!("You can pick up to {MAX_GAMES} games. Remove one to add another.")}</p> })}
+
+            <input
+                type="search"
+                class="picker-search"
+                placeholder="Search all of Steam…"
+                maxlength="60"
+                autocomplete="off"
+                prop:value=move || query.get()
+                on:input:target=move |ev| on_input(ev.target().value())
+            />
+            <p class="muted">{move || heading.get()}</p>
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+
+            <div class="game-grid" class:busy=move || loading.get()>
+                {move || {
+                    let list = shelf.get();
+                    if list.is_empty() && !loading.get() {
+                        return view! { <p class="muted">"No games found. Try another name."</p> }.into_any();
+                    }
+                    list.into_iter()
+                        .map(|g| {
+                            let id = g.app_id;
+                            let banner = g.banner_url();
+                            let name = g.name.clone();
+                            view! {
+                                <button
+                                    type="button"
+                                    class="game-tile"
+                                    class:on=move || selected.with(|v| v.iter().any(|x| x.app_id == id))
+                                    on:click=move |_| toggle(g.clone())
+                                >
+                                    <span class="g-art">
+                                        <img src=banner alt="" loading="lazy" on:error:target=move |ev| ev.target().set_hidden(true) />
+                                    </span>
+                                    <span class="g-name">{name}</span>
+                                    <span class="g-check">"✓"</span>
+                                </button>
+                            }
+                        })
+                        .collect_view()
+                        .into_any()
+                }}
+            </div>
+        </div>
+    }
+}
+
+/// A short message under the top menu, which hides itself after a few seconds.
+#[component]
+pub fn NoticeBar() -> impl IntoView {
+    let notice = expect_context::<api::NoticeSignal>();
+    let generation = StoredValue::new(0u64);
+    Effect::new(move |_| {
+        if notice.get().is_some() {
+            generation.update_value(|g| *g += 1);
+            let g = generation.get_value();
+            set_timeout(
+                move || {
+                    if generation.get_value() == g {
+                        notice.set(None);
+                    }
+                },
+                Duration::from_secs(8),
+            );
+        }
+    });
+    view! {
+        {move || {
+            notice
+                .get()
+                .map(|m| {
+                    view! {
+                        <div class="notice" role="status">
+                            <span>{m}</span>
+                            <button class="link" on:click=move |_| notice.set(None)>"✕"</button>
+                        </div>
+                    }
+                })
+        }}
     }
 }
