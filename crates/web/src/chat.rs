@@ -72,7 +72,11 @@ impl ChatClient {
 
     /// Queue a frame for the server. Returns false if there is no open connection.
     pub fn send(&self, msg: ClientMsg) -> bool {
-        self.out.with_value(|o| o.as_ref().map(|tx| tx.unbounded_send(msg).is_ok()).unwrap_or(false))
+        self.out.with_value(|o| {
+            o.as_ref()
+                .map(|tx| tx.unbounded_send(msg).is_ok())
+                .unwrap_or(false)
+        })
     }
 
     /// Listen for server events. Remember to `unsubscribe` in `on_cleanup`.
@@ -93,7 +97,9 @@ impl ChatClient {
     }
 
     fn dispatch(&self, msg: &ServerMsg) {
-        let listeners: Vec<Listener> = self.listeners.with_value(|v| v.iter().map(|(_, f)| f.clone()).collect());
+        let listeners: Vec<Listener> = self
+            .listeners
+            .with_value(|v| v.iter().map(|(_, f)| f.clone()).collect());
         for f in listeners {
             f(msg);
         }
@@ -109,7 +115,9 @@ impl ChatClient {
         spawn_local(async move {
             TimeoutFuture::new(150).await;
             client.refresh_pending.set_value(false);
-            let Some(s) = session.get_untracked() else { return };
+            let Some(s) = session.get_untracked() else {
+                return;
+            };
             match api::get::<Vec<MatchSummary>>("/matches", Some(&s.token)).await {
                 Ok(v) => {
                     client.matches.set(v);
@@ -143,7 +151,10 @@ async fn run(client: ChatClient, session: SessionSignal, s: Session, generation:
         if let Ok(ws) = WebSocket::open(&api::ws_url()) {
             let (mut write, mut read) = ws.split();
             // First frame authenticates. The token is never put in the URL.
-            let auth = serde_json::to_string(&ClientMsg::Auth { token: s.token.clone() }).unwrap_or_default();
+            let auth = serde_json::to_string(&ClientMsg::Auth {
+                token: s.token.clone(),
+            })
+            .unwrap_or_default();
             let _ = write.send(Message::Text(auth)).await;
 
             let (tx, mut rx) = mpsc::unbounded::<ClientMsg>();
@@ -152,7 +163,9 @@ async fn run(client: ChatClient, session: SessionSignal, s: Session, generation:
             }
             spawn_local(async move {
                 while let Some(msg) = rx.next().await {
-                    let Ok(json) = serde_json::to_string(&msg) else { continue };
+                    let Ok(json) = serde_json::to_string(&msg) else {
+                        continue;
+                    };
                     if write.send(Message::Text(json)).await.is_err() {
                         break;
                     }
@@ -163,8 +176,12 @@ async fn run(client: ChatClient, session: SessionSignal, s: Session, generation:
                 if !current() {
                     break;
                 }
-                let Ok(Message::Text(text)) = frame else { continue };
-                let Ok(msg) = serde_json::from_str::<ServerMsg>(&text) else { continue };
+                let Ok(Message::Text(text)) = frame else {
+                    continue;
+                };
+                let Ok(msg) = serde_json::from_str::<ServerMsg>(&text) else {
+                    continue;
+                };
                 match &msg {
                     ServerMsg::Ready { .. } => {
                         client.status.set(ChatStatus::Online);

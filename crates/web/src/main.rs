@@ -5,11 +5,14 @@ mod pages;
 
 use api::{load_session, Session};
 use chat::ChatClient;
-use components::{apply_theme, load_theme, BackgroundArt, Navbar};
+use components::{apply_theme, load_theme, BackgroundArt, Navbar, NoticeBar};
 use leptos::prelude::*;
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
-use pages::{Chat, Discover, Landing, Login, Matches, NotFound, ProfileEdit};
+use pages::{
+    AuthCallback, Chat, Discover, Friends, Invite, Landing, Login, Matches, NotFound, ProfileEdit,
+    Welcome,
+};
 
 #[component]
 fn App() -> impl IntoView {
@@ -17,6 +20,7 @@ fn App() -> impl IntoView {
     let theme = RwSignal::new(load_theme());
     let session = RwSignal::new(load_session());
     provide_context(theme);
+    provide_context::<api::NoticeSignal>(RwSignal::new(None));
     provide_context::<RwSignal<Option<Session>>>(session);
     // One WebSocket + the shared matches/unread store, alive for as long as someone is signed in.
     provide_context(ChatClient::new(session));
@@ -27,14 +31,19 @@ fn App() -> impl IntoView {
         <BackgroundArt />
         <Router>
             <Navbar />
+            <NoticeBar />
             <main class="main">
                 <Routes fallback=NotFound>
                     <Route path=path!("/") view=Landing />
                     <Route path=path!("/login") view=Login />
+                    <Route path=path!("/auth/callback") view=AuthCallback />
                     <Route path=path!("/discover") view=Discover />
                     <Route path=path!("/matches") view=Matches />
                     <Route path=path!("/chat/:id") view=Chat />
                     <Route path=path!("/profile") view=ProfileEdit />
+                    <Route path=path!("/welcome") view=Welcome />
+                    <Route path=path!("/friends") view=Friends />
+                    <Route path=path!("/invite/:code") view=Invite />
                 </Routes>
             </main>
         </Router>

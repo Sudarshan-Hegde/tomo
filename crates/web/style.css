@@ -511,3 +511,56 @@ body { display: flex; flex-direction: column; min-height: 100vh; min-height: 100
   .chat-head .conn { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .typing span { animation: none; } .bubbles { scroll-behavior: auto; } }
+
+/* The Discord button is a link (full-page redirect), so it needs button-like text styling. */
+a.btn { text-decoration: none; }
+a.btn.discord { width: 100%; }
+
+/* Discord pictures */
+.avatar { overflow: hidden; }
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.check.discord-avatar { display: flex; align-items: center; gap: 0.8rem; padding: 0.7rem 0.9rem; border: 1px solid var(--border); border-left: 3px solid #5865f2; background: var(--bg2); }
+.check.discord-avatar .da-img { width: 2.6rem; height: 2.6rem; border-radius: 50%; object-fit: cover; flex: none; }
+.welcome-note { margin: 0 0 1.5rem; padding: 1rem 1.2rem; border: 1px solid var(--border); border-left: 3px solid #5865f2; background: var(--card); max-width: 46rem; }
+.welcome-note p:last-child { color: var(--muted); font-size: 0.92rem; margin-top: 0.3rem; }
+
+/* ───────── Steam game picker ───────── */
+.picker { display: grid; gap: 0.6rem; }
+.picker-search { width: 100%; background: var(--bg2); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 0.7rem 0.9rem; font: inherit; outline: none; }
+.picker-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+.picker .count { font-size: 0.8rem; }
+.picked { display: flex; flex-wrap: wrap; gap: 0.5rem; min-height: 2.2rem; }
+.picked-game { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.6rem 0.2rem 0.2rem; border: 1px solid var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--card)); color: var(--text); font: inherit; font-size: 0.8rem; cursor: pointer; border-radius: 2px; }
+.picked-game img { height: 1.7rem; width: auto; border-radius: 2px; display: block; }
+.picked-game b { color: var(--muted); font-weight: 400; }
+.picked-game:hover b { color: var(--accent); }
+.game-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: 0.6rem; transition: opacity 0.2s; }
+.game-grid.busy { opacity: 0.5; }
+.game-tile { position: relative; display: block; padding: 0; border: 2px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; overflow: hidden; text-align: left; font: inherit; border-radius: 3px; transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s; }
+.game-tile:hover { transform: translateY(-2px); border-color: var(--muted); }
+.game-tile img { display: block; width: 100%; aspect-ratio: 460 / 215; object-fit: cover; background: var(--card2); }
+.game-tile .g-name { display: block; padding: 0.4rem 0.55rem; font-size: 0.78rem; line-height: 1.25; min-height: 2.3rem; }
+.game-tile .g-check { position: absolute; top: 0.4rem; right: 0.4rem; width: 1.5rem; height: 1.5rem; display: none; place-items: center; border-radius: 50%; background: var(--accent); color: var(--on-accent); font-weight: 800; box-shadow: var(--glow); }
+.game-tile.on { border-color: var(--accent); box-shadow: var(--glow); }
+.game-tile.on .g-check { display: grid; }
+.chip.game { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.15rem 0.55rem 0.15rem 0.15rem; }
+.chip.game .gthumb { height: 1.3rem; width: auto; border-radius: 2px; display: block; }
+
+/* ───────── Friends page, invite and notices ───────── */
+.panel { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 3px; padding: 1.2rem 1.4rem; margin-bottom: 1.4rem; display: grid; gap: 0.8rem; max-width: 56rem; }
+.panel h3 { font-size: 1.25rem; }
+.panel .sub { margin-top: 0.6rem; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.14em; color: var(--muted); }
+.copy-row { display: flex; gap: 0.6rem; align-items: stretch; }
+.copy-row input[type="text"] { flex: 1; min-width: 0; }
+.plain-list { margin: 0; padding-left: 1.2rem; color: var(--muted); font-size: 0.9rem; display: grid; gap: 0.25rem; }
+.notice { display: flex; align-items: center; justify-content: space-between; gap: 1rem; max-width: 56rem; margin: 0.8rem var(--gutter) 0; padding: 0.7rem 1rem; border: 1px solid var(--accent); border-left-width: 4px; background: color-mix(in srgb, var(--accent) 14%, var(--card)); position: relative; z-index: 5; }
+.check.servers-opt { align-items: flex-start; font-size: 0.82rem; color: var(--muted); text-align: left; }
+.check.servers-opt input { margin-top: 0.2rem; flex: none; }
+@media (max-width: 479px) { .copy-row { flex-direction: column; } .game-grid { grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); } }
+
+/* A banner that fails to load hides itself (the `hidden` attribute alone loses to display rules). */
+img[hidden] { display: none !important; }
+
+/* Banner frame: keeps the tile's shape (and a subtle backdrop) even if a banner is missing. */
+.game-tile .g-art { display: block; position: relative; aspect-ratio: 460 / 215; background: var(--card2); }
+.game-tile .g-art img { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; object-fit: cover; }
