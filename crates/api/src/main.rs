@@ -97,6 +97,7 @@ fn build_router(state: AppState) -> Router {
             get(servers::status).delete(servers::disconnect),
         )
         .route("/games/popular", get(games::popular))
+        .route("/games/other", get(games::other))
         .route("/games/search", get(games::search))
         .route("/invites/{code}", get(friends::preview))
         .route("/invites/accept", post(friends::accept))
