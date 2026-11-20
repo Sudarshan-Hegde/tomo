@@ -66,8 +66,10 @@ feature branch  ->  pull request  ->  CI passes  ->  merge to main  ->  live
 
 | | Where | Database | Discord app |
 |---|---|---|---|
-| Local | your machine | Neon `production` branch today (create a dev branch when real users arrive) | same app, `localhost` redirect |
+| Local | your machine | Neon `dev` branch (a copy of production's data, safe to break) | same app, `localhost` redirect |
 | Production | Render + Cloudflare Pages | Neon | same app, live redirect |
 
-> **Heads up:** local development currently shares the production database. That is fine while there are no
-> real users, but before launch create a separate Neon branch for development and point `.env.local` at it.
+> **Never run local code against the production database.** Migrations run on startup, so a newer local
+> build would apply a migration the live API does not know about, and the live API would then refuse to start.
+> Local `.env.local` points at the `dev` branch. To reset it to a fresh copy of production:
+> `neon branches reset dev --parent --project-id <project id>`.

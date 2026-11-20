@@ -44,7 +44,15 @@ pub struct Game {
     pub banner: Option<String>,
 }
 
+/// Games that are not on Steam get ids from here up. Steam's own app ids stay far below this.
+pub const OTHER_GAME_BASE: u32 = 9_000_000;
+
 impl Game {
+    /// True for the hand-picked games that are not on Steam (no banner image, styled tile instead).
+    pub fn is_other(&self) -> bool {
+        self.app_id >= OTHER_GAME_BASE
+    }
+
     /// The game's banner on Steam's image host. Built from the numeric id and a path that the
     /// server has already checked, so the host can never be anything else.
     pub fn banner_url(&self) -> String {
@@ -472,6 +480,22 @@ mod tests {
         assert!(p.validate().is_ok(), "exactly the maximum is fine");
         p.games.push(9999);
         assert!(p.validate().is_err(), "one over the maximum");
+    }
+
+    #[test]
+    fn games_outside_steam_are_recognised_by_their_id() {
+        let steam = Game {
+            app_id: 730,
+            name: "Counter-Strike 2".into(),
+            banner: None,
+        };
+        let other = Game {
+            app_id: OTHER_GAME_BASE + 1,
+            name: "Valorant".into(),
+            banner: None,
+        };
+        assert!(!steam.is_other());
+        assert!(other.is_other());
     }
 
     #[test]

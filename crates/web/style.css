@@ -564,3 +564,11 @@ img[hidden] { display: none !important; }
 /* Banner frame: keeps the tile's shape (and a subtle backdrop) even if a banner is missing. */
 .game-tile .g-art { display: block; position: relative; aspect-ratio: 460 / 215; background: var(--card2); }
 .game-tile .g-art img { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; object-fit: cover; }
+
+/* Games that are not on Steam have no banner: a tile in a colour taken from the game, with initials. */
+.g-fallback { display: grid; place-items: center; font-weight: 800; letter-spacing: 0.04em; color: hsl(var(--gh) 70% 82%);
+  background: linear-gradient(135deg, hsl(var(--gh) 45% 16%), hsl(var(--gh) 55% 30%)); }
+.g-art .g-fallback { position: absolute; inset: 0; font-size: 1.8rem; }
+.gthumb.g-fallback { width: 1.6rem; height: 1.6rem; font-size: 0.6rem; border-radius: 3px; flex: none; }
+.picked-game .g-fallback { width: 2.2rem; height: 1.1rem; font-size: 0.6rem; flex: none; }
+.shelf-title { margin-top: 1.2rem; }

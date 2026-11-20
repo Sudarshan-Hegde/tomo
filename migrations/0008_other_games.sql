@@ -1,0 +1,31 @@
+-- Games that are not on Steam. They get ids from 9,000,000 up (OTHER_GAME_BASE in tomo-shared),
+-- far above any Steam app id, so the two sources can never collide. They have no banner image;
+-- the website draws a styled tile instead.
+INSERT INTO games (app_id, name) VALUES
+    (9000001, 'Valorant'),
+    (9000002, 'League of Legends'),
+    (9000003, 'Fortnite'),
+    (9000004, 'Minecraft'),
+    (9000005, 'Genshin Impact'),
+    (9000006, 'Honkai: Star Rail'),
+    (9000007, 'Zenless Zone Zero'),
+    (9000008, 'Wuthering Waves'),
+    (9000009, 'Roblox'),
+    (9000010, 'Teamfight Tactics'),
+    (9000011, 'League of Legends: Wild Rift'),
+    (9000012, 'Mobile Legends: Bang Bang'),
+    (9000013, 'PUBG Mobile'),
+    (9000014, 'Call of Duty: Mobile'),
+    (9000015, 'Free Fire'),
+    (9000016, 'Brawl Stars'),
+    (9000017, 'Clash Royale'),
+    (9000018, 'Clash of Clans'),
+    (9000019, 'Pokémon GO'),
+    (9000020, 'Pokémon UNITE'),
+    (9000021, 'Hearthstone'),
+    (9000022, 'World of Warcraft'),
+    (9000023, 'Diablo IV'),
+    (9000024, 'EA Sports FC'),
+    (9000025, 'Chess.com'),
+    (9000026, 'osu!')
+ON CONFLICT (app_id) DO NOTHING;

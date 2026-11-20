@@ -157,6 +157,45 @@ pub fn Navbar() -> impl IntoView {
     }
 }
 
+/// Two letters for a game that has no banner ("League of Legends" -> "LL").
+fn game_initials(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut out: String = match words.as_slice() {
+        [] => "?".into(),
+        [one] => one.chars().take(2).collect(),
+        [first, second, ..] => first
+            .chars()
+            .take(1)
+            .chain(second.chars().take(1))
+            .collect(),
+    };
+    out = out.to_uppercase();
+    out
+}
+
+/// A game's picture: its Steam banner, or (for games that are not on Steam) a styled tile in a
+/// colour taken from the game's id, with its initials.
+#[component]
+pub fn GameArt(game: Game, #[prop(optional)] class: &'static str) -> impl IntoView {
+    if game.is_other() {
+        let hue = (game.app_id.wrapping_mul(47)) % 360;
+        let initials = game_initials(&game.name);
+        view! {
+            <span class=format!("g-fallback {class}") style=format!("--gh:{hue}") aria-hidden="true">{initials}</span>
+        }
+        .into_any()
+    } else {
+        let banner = game.banner_url();
+        view! {
+            <img class=class src=banner alt="" loading="lazy" on:error:target=move |ev| ev.target().set_hidden(true) />
+        }
+        .into_any()
+    }
+}
+
 #[component]
 pub fn ProfileCard(profile: Profile, #[prop(optional)] reasons: Vec<String>) -> impl IntoView {
     // Each game shows its Steam banner as a small thumbnail. A missing banner just hides itself.
@@ -165,11 +204,11 @@ pub fn ProfileCard(profile: Profile, #[prop(optional)] reasons: Vec<String>) -> 
         .iter()
         .take(8)
         .map(|g| {
-            let banner = g.banner_url();
+            let name = g.name.clone();
             view! {
                 <span class="chip game">
-                    <img class="gthumb" src=banner alt="" loading="lazy" on:error:target=move |ev| ev.target().set_hidden(true) />
-                    {g.name.clone()}
+                    <GameArt game=g.clone() class="gthumb" />
+                    {name}
                 </span>
             }
         })
@@ -379,6 +418,7 @@ pub fn GamePicker(selected: RwSignal<Vec<Game>>) -> impl IntoView {
     let query = RwSignal::new(String::new());
     let shelf = RwSignal::new(Vec::<Game>::new()); // what the grid currently shows
     let popular = RwSignal::new(Vec::<Game>::new());
+    let others = RwSignal::new(Vec::<Game>::new()); // hand-picked games that are not on Steam
     let heading = RwSignal::new("Popular on Steam right now".to_string());
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
@@ -401,6 +441,18 @@ pub fn GamePicker(selected: RwSignal<Vec<Game>>) -> impl IntoView {
                 Err(e) => error.set(Some(api::handle_err(session, e))),
             }
             loading.set(false);
+        });
+    });
+
+    // Best effort: the picker works without this shelf if the request fails.
+    Effect::new(move |_| {
+        let Some(s) = session.get_untracked() else {
+            return;
+        };
+        leptos::task::spawn_local(async move {
+            if let Ok(v) = api::get::<Vec<Game>>("/games/other", Some(&s.token)).await {
+                others.set(v);
+            }
         });
     });
 
@@ -477,11 +529,10 @@ pub fn GamePicker(selected: RwSignal<Vec<Game>>) -> impl IntoView {
                     }
                     list.into_iter()
                         .map(|g| {
-                            let banner = g.banner_url();
                             let name = g.name.clone();
                             view! {
-                                <button type="button" class="picked-game" title="Remove" on:click=move |_| toggle(g.clone())>
-                                    <img src=banner alt="" loading="lazy" on:error:target=move |ev| ev.target().set_hidden(true) />
+                                <button type="button" class="picked-game" title="Remove" on:click={let g = g.clone(); move |_| toggle(g.clone())}>
+                                    <GameArt game=g.clone() />
                                     <span>{name}</span>
                                     <b>"✕"</b>
                                 </button>
@@ -497,7 +548,7 @@ pub fn GamePicker(selected: RwSignal<Vec<Game>>) -> impl IntoView {
             <input
                 type="search"
                 class="picker-search"
-                placeholder="Search all of Steam…"
+                placeholder="Search Steam and other games…"
                 maxlength="60"
                 autocomplete="off"
                 prop:value=move || query.get()
@@ -507,36 +558,60 @@ pub fn GamePicker(selected: RwSignal<Vec<Game>>) -> impl IntoView {
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
 
             <div class="game-grid" class:busy=move || loading.get()>
-                {move || {
-                    let list = shelf.get();
-                    if list.is_empty() && !loading.get() {
-                        return view! { <p class="muted">"No games found. Try another name."</p> }.into_any();
-                    }
-                    list.into_iter()
-                        .map(|g| {
-                            let id = g.app_id;
-                            let banner = g.banner_url();
-                            let name = g.name.clone();
-                            view! {
-                                <button
-                                    type="button"
-                                    class="game-tile"
-                                    class:on=move || selected.with(|v| v.iter().any(|x| x.app_id == id))
-                                    on:click=move |_| toggle(g.clone())
-                                >
-                                    <span class="g-art">
-                                        <img src=banner alt="" loading="lazy" on:error:target=move |ev| ev.target().set_hidden(true) />
-                                    </span>
-                                    <span class="g-name">{name}</span>
-                                    <span class="g-check">"✓"</span>
-                                </button>
-                            }
-                        })
-                        .collect_view()
-                        .into_any()
-                }}
+                <GameTiles games=Signal::derive(move || shelf.get()) selected=selected on_toggle=Callback::new(toggle) empty_note=move || !loading.get() />
             </div>
+
+            // The hand-picked games that are not on Steam stay available while browsing (not searching).
+            {move || {
+                let list = others.get();
+                (query.with(|q| q.trim().chars().count() < 2) && !list.is_empty()).then(|| view! {
+                    <p class="muted shelf-title">"Not on Steam"</p>
+                    <div class="game-grid">
+                        <GameTiles games=Signal::derive(move || others.get()) selected=selected on_toggle=Callback::new(toggle) empty_note=|| false />
+                    </div>
+                })
+            }}
         </div>
+    }
+}
+
+/// A grid of selectable game tiles.
+#[component]
+fn GameTiles(
+    games: Signal<Vec<Game>>,
+    selected: RwSignal<Vec<Game>>,
+    on_toggle: Callback<Game>,
+    empty_note: impl Fn() -> bool + Send + Sync + 'static,
+) -> impl IntoView {
+    move || {
+        let list = games.get();
+        if list.is_empty() {
+            return empty_note()
+                .then(|| view! { <p class="muted">"No games found. Try another name."</p> })
+                .into_any();
+        }
+        list.into_iter()
+            .map(|g| {
+                let id = g.app_id;
+                let name = g.name.clone();
+                let art = g.clone();
+                view! {
+                    <button
+                        type="button"
+                        class="game-tile"
+                        class:on=move || selected.with(|v| v.iter().any(|x| x.app_id == id))
+                        on:click=move |_| on_toggle.run(g.clone())
+                    >
+                        <span class="g-art">
+                            <GameArt game=art />
+                        </span>
+                        <span class="g-name">{name}</span>
+                        <span class="g-check">"✓"</span>
+                    </button>
+                }
+            })
+            .collect_view()
+            .into_any()
     }
 }
 
